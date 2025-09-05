@@ -1,0 +1,322 @@
+/*  ChainManager.sc
+    Manages an Ndef-based audio-effect chain with 8 (extensible) slots.
+    - Slot 0: pulsed test signal (stereo)
+    - Slots 1..(n-1): replaceable filters (default: \bypass)
+    - Last slot outputs to main bus via Ndef.play (normal behavior)
+
+    Author: Martin Dupras (design) + assistant (impl)
+*/
+
+ChainManager : Object {
+
+	classvar < registry;      // IdentityDictionary[ nameSymbol -> instance ]
+	classvar < nameCounter;   // Integer counter for generating unique names
+
+	var < name;               // Symbol — unique chain name (also the Ndef key)
+	var < numSlots;           // Integer — number of slots in the chain
+	var < slotSpec;           // Array of Symbols describing each slot's role
+	var < procDefs;           // IdentityDictionary[ Symbol -> Function returning a slot function ]
+	var < isPlaying;          // Boolean
+	var <> fadeTime = 0.1;    // default Ndef fade time
+
+	*initClass {
+		registry = IdentityDictionary.new;
+		nameCounter = 0;
+	}
+
+	*uniqueName { |base=\chain|
+		var candidate;
+		candidate = base.asSymbol;
+		// ensure unique among existing chains
+		while { registry.includesKey(candidate) } {
+			nameCounter = nameCounter + 1;
+			candidate = (base.asString ++ nameCounter.asString).asSymbol;
+		};
+		^candidate  // returns a unique Symbol safe to use as a chain/Ndef name
+	}
+
+	*new { |name=nil, numSlots=8|
+		var instance;
+		instance = super.new.init(name, numSlots);
+		^instance  // returns a new ChainManager instance
+	}
+
+	*allInstances {
+		^registry.copy  // returns a shallow copy of the name->instance registry
+	}
+
+	*freeAll {
+		var keys, i;
+		keys = registry.keys;
+		i = 0;
+		while { i < keys.size } {
+			registry[keys[i]].free;
+			i = i + 1;
+		};
+		^this
+	}
+
+	init { |nm=nil, nSlots=8|
+		var baseName, finalName;
+
+		// ----- name -----
+		baseName = if (nm.isNil) { "chain" } { nm.asString };
+		if (registry.isNil) { registry = IdentityDictionary.new }; // safety
+		finalName = this.class.uniqueName(baseName.asSymbol);
+
+		// ----- slots -----
+		numSlots  = nSlots.max(2);  // at least 2 (source + one filter)
+		name      = finalName.asSymbol;
+		isPlaying = false;
+
+		this.defineDefaultProcDefs;
+
+		// default chain: slot 0 test signal, rest bypass
+		slotSpec = Array.fill(numSlots, { \bypass });
+		slotSpec.put(0, \testsignal);
+
+		// create / init Ndef with given slotSpec
+		this.buildChain;
+
+		registry.put(name, this);
+		^this
+	}
+
+	// -----------------------------
+	// Processor definitions
+	// Each entry returns a function suitable for Ndef slot assignment:
+	//   - Source: { ... }  (no `in` arg)
+	//   - Filter: \filter -> { |in| ... }
+	// -----------------------------
+	defineDefaultProcDefs {
+		var hp, lp, trem, bypass, testsig;
+
+		// High-pass (gentle)
+		hp = {
+			\filter -> { |in, freq=300|
+				var cut;
+				cut = freq.clip(10, 20000);
+				HPF.ar(in, cut)
+			}
+		};
+
+		// Low-pass (gentle)
+		lp = {
+			\filter -> { |in, freq=2000|
+				var cut;
+				cut = freq.clip(50, 20000);
+				LPF.ar(in, cut)
+			}
+		};
+
+		// Fast, very audible "chopping" tremolo
+		trem = {
+			\filter -> { |in, rate=12, depth=1.0, duty=0.5|
+				var chop, amount, dutyClamped;
+				dutyClamped = duty.clip(0.05, 0.95);
+				amount      = depth.clip(0, 1);
+				chop        = LFPulse.kr(rate.max(0.1), 0, dutyClamped).lag(0.001);  // crisp, but not clicky
+				in * (chop * amount + (1 - amount))
+			}
+		};
+
+		// Bypass (passthrough)
+		bypass = {
+			\filter -> { |in| in }
+		};
+
+		// Pulsed test signal (stereo), not obnoxious
+		testsig = {
+			{
+				var trig, env, freqs, tone, pan, amp;
+				trig  = Impulse.kr(2);                // 2 pulses per second
+				env   = Decay2.kr(trig, 0.01, 0.15);  // short 'ping'
+				freqs = [220, 330];
+				tone  = SinOsc.ar(freqs, 0, 0.15).sum; // gentle
+				amp   = env * 0.9;
+				pan   = [-0.2, 0.2];
+				[tone * amp, tone * amp] * (1 + pan)  // subtle L/R emphasis
+			}
+		};
+
+		procDefs = IdentityDictionary.new;
+		procDefs.put(\hp,         hp);
+		procDefs.put(\lp,         lp);
+		procDefs.put(\tremolo,    trem);
+		procDefs.put(\bypass,     bypass);
+		procDefs.put(\testsignal, testsig);
+	}
+
+	addProcessor { |keySymbol, makerFunc|
+		var key;
+		key = keySymbol.asSymbol;
+		procDefs.put(key, makerFunc);
+		^this
+	}
+
+	// -----------------------------
+	// Build the actual Ndef chain from slotSpec
+	// -----------------------------
+	buildChain {
+		var i, symbol, maker;
+
+		// Proxy setup
+		Ndef(name).fadeTime = fadeTime;
+
+		// Slot 0 (source)
+		symbol = slotSpec[0];
+		maker = procDefs.at(symbol);
+		if (maker.isNil) {
+			// If slot 0 is not defined, fallback to testsignal
+			maker = procDefs[\testsignal];
+			slotSpec.put(0, \testsignal);
+		};
+		Ndef(name)[0] = maker.value;
+
+		// Slots 1..(numSlots-1) filters
+		i = 1;
+		while { i < numSlots } {
+			symbol = slotSpec[i];
+			maker = procDefs.at(symbol);
+			if (maker.isNil) { maker = procDefs[\bypass] };
+			Ndef(name)[i] = maker.value;
+			i = i + 1;
+		};
+	}
+
+	// -----------------------------
+	// Public API
+	// -----------------------------
+	play {
+		var wasPlaying;
+		wasPlaying = isPlaying;
+		if (wasPlaying.not) {
+			Ndef(name).play;
+			isPlaying = true;
+		};
+		^this
+	}
+
+	stop {
+		var wasPlaying;
+		wasPlaying = isPlaying;
+		if (wasPlaying) {
+			Ndef(name).stop;
+			isPlaying = false;
+		};
+		^this
+	}
+
+	free {
+		var removed;
+		removed = registry.removeAt(name);  // removed = the instance that was stored under this name, or nil
+		// Clear the Ndef slots; keeping standard behavior, no server syncs
+		Ndef(name).clear;
+		isPlaying = false;
+		^removed  // returns the removed instance (or nil) so callers can confirm disposal
+	}
+
+	setSlot { |index, symbol|
+		var sym, maker, slotIndex;
+
+		slotIndex = index.asInteger.clip(0, numSlots - 1);
+		sym = symbol.asSymbol;
+
+		slotSpec.put(slotIndex, sym);
+		maker = procDefs.at(sym);
+
+		if (maker.isNil) {
+			// Unknown symbol falls back to bypass for filters or testsignal for slot 0
+			if (slotIndex == 0) {
+				maker = procDefs[\testsignal];
+				slotSpec.put(0, \testsignal);
+			} {
+				maker = procDefs[\bypass];
+			};
+		};
+
+		// Apply to Ndef
+		if (slotIndex == 0) {
+			Ndef(name)[0] = maker.value;     // source
+		} {
+			Ndef(name)[slotIndex] = maker.value;   // filter
+		};
+
+		^this
+	}
+
+	setChainSpec { |arrayOfSymbols|
+		var spec, symbol, i;
+
+		spec = arrayOfSymbols.as(Array);
+
+		// Pad or trim to numSlots
+		if (spec.size < numSlots) {
+			spec = spec ++ Array.fill(numSlots - spec.size, { \bypass });
+		} {
+			if (spec.size > numSlots) {
+				spec = spec.copyRange(0, numSlots - 1);
+			};
+		};
+
+		// Ensure slot 0 is a generator; default to \testsignal
+		symbol = spec[0];
+		if (procDefs.at(symbol).isNil or: { symbol != \testsignal }) {
+			spec.put(0, \testsignal);
+		};
+
+		slotSpec = spec;
+		this.buildChain;
+		^this
+	}
+
+	// Generic parameter setter (for live control of whatever params current slots expose)
+	set { |...paramPairs|
+		var pairs;
+		pairs = paramPairs;
+		if (pairs.size.odd) {
+			"ChainManager[%]: odd number of set() items ignored tail.".format(name).warn;
+		};
+		Ndef(name).set(*pairs);
+		^this
+	}
+
+	// Introspection: posts and returns a copy of the current slotSpec
+	status {
+		var info;
+		info = "ChainManager[%] slots: %".format(name, slotSpec);
+		info.postln;
+		^slotSpec.copy  // returns a copy so callers don't mutate internal state inadvertently
+	}
+
+	// Simple inline help: prints usage summary & returns this
+	help {
+		var keys, lines;
+		keys = procDefs.keys.asArray.sort;
+
+		lines = [
+			"ChainManager.help",
+			"----------------------------------------",
+			"Create:    c = ChainManager.new(\\myChain, 8);",
+			"Play/Stop: c.play;  c.stop;",
+			"Inspect:   c.status;  // prints and returns copy of slot spec",
+			"Set slot:  c.setSlot(3, \\hp);  c.setSlot(4, \\lp);  c.setSlot(5, \\tremolo);",
+			"Set chain: c.setChainSpec([\\testsignal, \\hp, \\tremolo, \\lp, \\bypass, \\bypass, \\bypass, \\bypass]);",
+			"Params:    Ndef(c.getName).set(\\freq, 600, \\rate, 14, \\depth, 1.0);",
+			"Free:      c.free;   // removes from registry and clears Ndef",
+			"",
+			"Available processors: " ++ keys.asString
+		];
+
+		// Post lines one by one (no String.join)
+		lines.do { |line| line.postln };
+
+		^this  // return the instance for chaining
+	}
+
+
+	// Accessors (simple getters)
+	getName { ^name }            // returns the Symbol used for the Ndef key
+	getNumSlots { ^numSlots }    // returns current number of slots in this chain
+	getSpec { ^slotSpec.copy }   // returns a copy of the slotSpec (protects internal state)
+}
