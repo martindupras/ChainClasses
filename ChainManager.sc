@@ -1,4 +1,4 @@
-/*  ChainManager.sc  — v2.1
+/*  ChainManager.sc  — v2.2
     Manages an Ndef-based audio-effect chain with N slots (default 8).
 
     Key improvements vs. v2:
@@ -18,6 +18,8 @@
 */
 
 ChainManager : Object {
+    classvar < version = "v2.2";
+    var verbose = true;
 
     // ----- class state -----
     classvar < registry;      // IdentityDictionary[nameSymbol -> instance]
@@ -56,7 +58,15 @@ ChainManager : Object {
         ^registry.copy   // -> copy of { name -> instance } for discovery/GUI/bulk ops
     }
 
-    *freeAll {
+// ChainManager.sc
+*freeAll {
+    var instances = registry.values.asArray;   // snapshot
+    instances.do { |inst| inst.freeImmediate }; // immediate clear, less chance of late /n_set
+    ^this
+}
+
+
+/*    *freeAll {
         var keys, i;
         keys = registry.keys;
         i = 0;
@@ -65,11 +75,13 @@ ChainManager : Object {
             i = i + 1;
         };
         ^this
-    }
+    }*/
 
     // ----- init -----
-    init { |nm = nil, nSlots = 8|
+    init { |nm = nil, nSlots = 8, verbose = true|
         var baseName, finalName;
+        verbose = verbose;
+        if (verbose) { ("[ChainManager] Initialized (% version)").format(version).postln };
 
         baseName = if (nm.isNil) { "chain" } { nm.asString };
         if (registry.isNil) { registry = IdentityDictionary.new };

@@ -1,0 +1,57 @@
+// ChainController.sc
+// v0.1
+// MD 20250905:1145
+
+
+ChainController : Object {
+    classvar < version = "v0.1";
+    var currentChain, nextChain, verbose = true;
+
+    *new { arg verbose = true;
+        var instance = super.new.init(verbose);
+        ^instance
+    }
+
+    init { arg v;
+        verbose = v;
+        if (verbose) {
+            ("[ChainController] Initialized (% version)").format(version).postln;
+        };
+        ^this
+    }
+
+    setCurrent { arg chainManager;
+        currentChain = chainManager;
+        ("[ChainController] Current chain set to %".format(chainManager.getName)).postln;
+        ^this
+    }
+
+    setNext { arg chainManager;
+        nextChain = chainManager;
+        ("[ChainController] Next chain set to %".format(chainManager.getName)).postln;
+        ^this
+    }
+
+    switchNow {
+        if (nextChain.notNil) {
+            if (currentChain.notNil) {
+                currentChain.stop;
+            };
+            nextChain.play;
+            currentChain = nextChain;
+            nextChain = nil;
+            ("[ChainController] Switched to chain %.".format(currentChain.getName)).postln;
+        } {
+            "[ChainController] No next chain to switch to.".postln;
+        };
+        ^this
+    }
+
+    status {
+        ("[ChainController] Current: %, Next: %".format(
+            currentChain.getName ? "None",
+            nextChain.getName ? "None"
+        )).postln;
+        ^this
+    }
+}
