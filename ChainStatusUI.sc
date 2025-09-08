@@ -197,62 +197,38 @@ ChainStatusUI {
 		^s
 	}
 
-	// ChainStatusUI.sc  (only the refresh method changed here)
-	refresh {
-		var c, n, cSpec, nSpec, cSlots, nSlots, needed;
-		var i, sym, box, lab, color, cname, nname;
 
-		c = currentChainRef;
-		n = nextChainRef;
+refresh {
+    var c, n, cSpec, nSpec, cSlots, nSlots, needed;
+    var i, sym, box, lab, color, cname, nname;
 
-		cSlots = 0; if(c.notNil) { cSlots = c.getNumSlots };       // <- from ChainManager
-		nSlots = 0; if(n.notNil) { nSlots = n.getNumSlots };       // <- from ChainManager
+    c = currentChainRef;
+    n = nextChainRef;
 
-		needed = cSlots.max(nSlots);
-		if(needed == 0) { needed = maxSlots };
+    // EARLY: See what the UI is holding
+    this.traceOnce;
+    this.validateViews;
 
-		// *** critical change: rebuild and exit; the deferred refresh will actually paint ***
-		if(needed != maxSlots) {
-			this.setMaxSlots(needed);   // rebuilds boxes and does { this.refresh }.defer
-			^this;
-		};
+    // ... your existing refresh code ...
 
-		cname = "Current: -"; if(c.notNil) { cname = "Current: " ++ c.getName.asString };
-		titleCurrent.string_(cname);
+    // After cSpec/nSpec are set and before painting:
+    cSpec = Array.fill(maxSlots, { \bypass });
+    nSpec = Array.fill(maxSlots, { \bypass });
+    if(c.notNil) { cSpec = c.getSpec };
+    if(n.notNil) { nSpec = n.getSpec };
 
-		nname = "Next: -"; if(n.notNil) { nname = "Next: " ++ n.getName.asString };
-		titleNext.string_(nname);
+    // LATE: confirm what will actually be painted
+    ("[ChainStatusUI] paint with maxSlots:%  cur:%  next:%")
+    .format(maxSlots, cSpec, nSpec).postln;
 
-		cSpec = Array.fill(maxSlots, { \bypass });
-		nSpec = Array.fill(maxSlots, { \bypass });
+    i = 0;
+    while({ i < maxSlots }, {
+        // ... paint as you already do ...
+        i = i + 1;
+    });
+    ^this
+}
 
-		if(c.notNil) { cSpec = c.getSpec };    // -> Array<Symbol> from ChainManager
-		if(n.notNil) { nSpec = n.getSpec };
-
-		i = 0;
-		while({ i < maxSlots }, {
-			// Current panel
-			//sym = (i < cSpec.size).if({ cSpec[i] }, { \bypass });
-			sym = (i < cSpec.size).if({ this.normalizeToSymbol(cSpec[i]) }, { \bypass });
-			box = currentBoxes[i];
-			lab = currentLabels[i];
-			color = this.slotColorFor(sym, true, i);
-			if(box.notNil) { box.background_(color) };
-			if(lab.notNil) { lab.string_(this.shortName(sym)) };
-
-			// Next panel
-			//sym = (i < nSpec.size).if({ nSpec[i] }, { \bypass });
-			sym = (i < nSpec.size).if({ this.normalizeToSymbol(nSpec[i]) }, { \bypass });
-			box = nextBoxes[i];
-			lab = nextLabels[i];
-			color = this.slotColorFor(sym, false, i);
-			if(box.notNil) { box.background_(color) };
-			if(lab.notNil) { lab.string_(this.shortName(sym)) };
-
-			i = i + 1;
-		});
-		^this
-	}
 
 
 	// Add to ChainStatusUI (near utilities)
