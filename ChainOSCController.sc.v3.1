@@ -1,0 +1,211 @@
+// File: ChainOSCController.sc
+
+// File: ChainOSCController.sc
+// Version: v0.3.1
+
+/*
+    ChainOSCController — v0.3.1
+    MD 2025-09-05
+
+    PURPOSE
+    -------
+    Entry point for performer OSC commands. Installs named OSCdef routes and
+    forwards actions into the system (typically via ChainController and ChainManager).
+    Hot‑reload safe (named defs + .free()) and test‑friendly (optional handler Functions).
+
+    HOW THE SYSTEM FITS TOGETHER (first principles)
+    -----------------------------------------------
+      Performer (OSC)  ──>  ChainOSCController  ──>  ChainController  ──>  ChainManager  ──>  Ndef  ──>  FOH
+                                      |                    |                  |
+                                      |                    └── setNext(...)   ├── setSlot(i, \proc)
+                                      |                                       ├── setChainSpec([...])
+                                      └── routes:  /chain / *                   ├── play / stop
+                                                                                └── free / freeImmediate
+
+      • ChainManager: Owns one Ndef‑based audio chain with N slots. Self‑registers in a class registry.
+      • ChainController: Keeps <currentChain> and <nextChain>. switchNow() promotes next → current.
+      • ChainRegistry: Thin convenience wrapper to list/free via ChainManager’s registry.
+      • ProcessorLibrary: Catalog of processors (optional here).
+
+    WHAT THIS CLASS DOES (minimal core)
+    -----------------------------------
+      • Installs *named* OSCdef routes (per instance) and keeps their symbols.
+      • Provides .free() to tear down only the installed defs (hot‑reload safe).
+      • Routes included by default:
+          - /demo/ping                (sanity/logging)
+          - /chain/setNext <name>     (notify controller or injected handler)
+          - /chain/switchNow          (notify controller or injected handler)
+
+    TESTABILITY
+    -----------
+      *new(controller, registry = nil, verbose = true, switchFunc = nil, setNextFunc = nil)
+        • switchFunc   : Function called on /chain/switchNow (test helper)
+        • setNextFunc  : Function called with <name> on /chain/setNext (test helper)
+      You can pass Functions instead of real classes to keep tests audio‑free.
+
+    STYLE / SAFETY
+    --------------
+      • var‑first in every Function/closure.
+      • No underscore‑prefixed method names (avoid PRIMITIVENAME parse errors).
+      • No OSCFunc.removeAll (not present in all builds).
+      • Posts are gated by a 'verbose' flag.
+      • v0.3.1: defNames uses Dictionary with Symbol keys to avoid IdentityDictionary+String pitfalls.
+
+*/
+
+ChainOSCController : Object {
+    classvar < version = "v0.3.1";
+
+    var verbose = true;
+    var controller, registry;
+
+    // v0.3.1: Dictionary + Symbol keys (path.asSymbol) for safe lookups
+    var defNames;         // Dictionary: path(Symbol) -> defKey(Symbol)
+    var id;               // per‑instance id for naming clarity
+    var switchHandler;    // optional Function
+    var setNextHandler;   // optional Function
+
+    *new { |controller, registry = nil, verbose = true, switchFunc = nil, setNextFunc = nil|
+        var instance;
+        instance = super.new.init(controller, registry, verbose, switchFunc, setNextFunc);
+        ^instance
+    }
+
+    init { |ctrl, reg, v, switchFunc, setNextFunc|
+        var hash;
+        controller     = ctrl;
+        registry       = reg;
+        verbose        = v;
+        switchHandler  = switchFunc;
+        setNextHandler = setNextFunc;
+
+        defNames = Dictionary.new;
+        hash = this.identityHash;
+        id = hash;
+
+        if (verbose) {
+            ("[ChainOSCController] init (version: %, id: %)".format(version, id)).postln;
+        };
+
+        this.installDefaultRoutes;
+        ^this
+    }
+
+    // -------------------- ROUTES --------------------
+
+    installDefaultRoutes {
+        // 1) /demo/ping  -> log
+        this.prInstall("/demo/ping", { |msg, time, addr, recvPort|
+            var args;
+            args = if(msg.size > 1) { msg.copyRange(1, msg.size - 1) } { [] };
+            this.prLog("RECV", "/demo/ping " ++ args.asString ++ " from " ++ addr.asString);
+            this.prLog("DO", "pong");
+            nil
+        });
+
+        // 2) /chain/setNext <name>  -> controller.setNext OR setNextHandler.(name)
+        this.prInstall("/chain/setNext", { |msg, time, addr, recvPort|
+            var name;
+            name = msg[1].asSymbol;
+            this.prLog("RECV", "/chain/setNext " ++ name.asString ++ " from " ++ addr.asString);
+
+            if (setNextHandler.notNil) {
+                setNextHandler.value(name);
+            }{
+                if (controller.notNil and: { controller.respondsTo(\setNext) }) {
+                    controller.setNext(name);
+                }{
+                    this.prLog("WARN", "no setNext handler or controller");
+                };
+            };
+            nil
+        });
+
+        // 3) /chain/switchNow  -> controller.switchNow OR switchHandler.()
+        this.prInstall("/chain/switchNow", { |msg, time, addr, recvPort|
+            this.prLog("RECV", "/chain/switchNow from " ++ addr.asString);
+
+            if (switchHandler.notNil) {
+                switchHandler.value;
+            }{
+                if (controller.notNil and: { controller.respondsTo(\switchNow) }) {
+                    controller.switchNow;
+                }{
+                    this.prLog("WARN", "no switchNow handler or controller");
+                };
+            };
+            nil
+        });
+
+        ^this
+    }
+
+    // -------------------- LIFECYCLE --------------------
+
+    free {
+        var syms;
+        syms = defNames.values.asArray;
+        syms.do { |sym|
+            var d;
+            d = OSCdef(sym);
+            if (d.notNil) { d.free };
+        };
+        defNames.clear;
+        if (verbose) {
+            ("[ChainOSCController] freed responders (id: %)".format(id)).postln;
+        };
+        ^this
+    }
+
+    // -------------------- HELPERS --------------------
+
+    prInstall { |path, func|
+        var pSym, defKey, action;
+        pSym = path.asSymbol; // v0.3.1: Symbol key
+        defKey = this.prMakeDefName(path);
+        action = { |msg, time, addr, recvPort|
+            var f;
+            f = func;
+            f.value(msg, time, addr, recvPort);
+            nil
+        };
+        OSCdef(defKey, action, path);
+        defNames[pSym] = defKey;
+        if (verbose) {
+            ("[ChainOSCController] installed % for %".format(defKey, path)).postln;
+        };
+        ^defKey
+    }
+
+    prMakeDefName { |path|
+        var safe, str;
+        safe = path.asString.collect { |ch|
+            var code, rep;
+            code = ch.ascii;
+            if (code == $/.ascii) { rep = $_ } { rep = ch };
+            rep
+        }.join;
+        str = "ChainOSCController_%_%_%".format(version, id, safe);
+        ^str.asSymbol
+    }
+
+    prLog { |label, text|
+        var doPost;
+        doPost = verbose;
+        if (doPost) {
+            ("[ChainOSCController] " ++ label ++ ": " ++ text.asString).postln;
+        };
+        ^this
+    }
+
+    // Accessors for tests/inspection
+    defNameForPath { |path|
+        var key;
+        key = path.asSymbol; // v0.3.1
+        ^defNames[key]
+    }
+
+    getDefNames {
+        ^defNames.copy
+    }
+}

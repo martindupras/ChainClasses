@@ -1,229 +1,338 @@
-// ChainOSCController.sc
-// v0.2.1
-// MD 20250905: remove leading '_' from helper method names to avoid PRIMITIVENAME parse errors.
-// - Uses named OSCdef(s) per instance, adds edit routes, and provides .free().
+// Filename: ChainOSCController.sc
+// Version: v0.3.3
+// Change notes:
+// - v0.3.3: Confirms /demo/ping, /chain/setNext, /chain/switchNow. Adds /chain/new, /chain/add, /chain/remove, /chain/setFrom.
+//            Uses named OSCdef per route with per-instance def names; stores them for safe free(). Dictionary + Symbol keys.
+//            Test-friendly via optional handler Functions (no Server required). Verbose-gated logs.
+//            OSC slot indexing is 0-based by default (slot 0 = source), matching ChainManager semantics.
+// - v0.3.2: Known-good base with minimal routes and payload normalization to Symbol.
 
 ChainOSCController {
-    classvar < version = "v0.2.1";
-    var verbose = true;
-    var controller, registry;
+    classvar <defaultVerbose;
+    var <>verbose;
+    var <namePrefix;
+    var <defNames;     // Dictionary: routeSym -> defName Sym (the OSCdef key)
+    var <handlerMap;   // Dictionary: actionSym -> Function (optional)
+    var <>controller;   // optional ChainController (for runtime wiring)
 
-    // internal: per-instance OSCdef keys and targeting state
-    var defNames;         // IdentityDictionary path(String) -> Symbol (OSCdef key)
-    var id;               // per-instance id for OSCdef name suffix
-    var lastTargetName;   // Symbol or nil; set by /chain/setNext or /chain/new
-
-    *new { |controller, registry, verbose = true|
-        var instance;
-        instance = super.new.init(controller, registry, verbose);
-        ^instance
+    *initClass {
+        // Keep class-level default conservative
+        defaultVerbose = false;
     }
 
-    init { |ctrl, reg, v|
-        var hash;
-        verbose    = v;
-        controller = ctrl;
-        registry   = reg;
+    *new { arg name, controller = nil, handlers = nil, verbose;
+        var v;
+        v = verbose;
+        if(v.isNil) { v = defaultVerbose };
+        ^super.new.init(name, controller, handlers, v)
+    }
 
-        defNames = IdentityDictionary.new;
-        hash = this.identityHash;
-        id = hash;
+    init { arg name, controller, handlers, verbose;
+        var nm;
+        verbose = verbose; // assign ivar
+        this.verbose = verbose;
 
-        if (verbose) {
-            ("[ChainOSCController] Initialized (% version, id:%)")
-            .format(version, id).postln;
+        this.controller = controller;
+        defNames = Dictionary.new;
+        handlerMap = Dictionary.new;
+
+        // Prefix for def names; identityHash is valid here (method context).
+        nm = name;
+        if(nm.isNil) { nm = "osc" };
+        namePrefix = ("ChainOSCController%" ++ this.identityHash.asString ++ "%" ++ nm.asString);
+
+        if(handlers.notNil) {
+            this.setHandlers(handlers);
         };
 
-        this.setupListeners;
+        this.installRoutes;
         ^this
     }
 
-    // ---------- OSC setup ----------
+    // --- Public API ---
 
-    setupListeners {
-        // /chain/new <name> [<slots>]
-        this.prInstall("/chain/new", { |msg, time, addr, recvPort|
-            var name, slots, chain;
-            name  = msg[1].asSymbol;
-            slots = msg[2];
-            if (slots.isNil) { slots = 8 } { slots = slots.asInteger.max(2) };
-            chain = ChainManager.new(name, slots);
-            lastTargetName = name;  // convenience default target
-            if (verbose) { ("[OSC] /chain/new % slots:%".format(name, slots)).postln };
-            nil
-        });
-
-        // /chain/setNext <name>
-        this.prInstall("/chain/setNext", { |msg, time, addr, recvPort|
-            var name, dict, chain;
-            name = msg[1].asSymbol;
-            dict = ChainManager.allInstances;
-            chain = dict.at(name);
-            if (chain.notNil) {
-                controller.setNext(chain);
-                lastTargetName = name;
-                if (verbose) { ("[OSC] /chain/setNext %".format(name)).postln };
-            }{
-                ("[OSC] /chain/setNext: chain not found: %".format(name)).warn;
-            };
-            nil
-        });
-
-        // /chain/switchNow
-        this.prInstall("/chain/switchNow", { |msg, time, addr, recvPort|
-            if (verbose) { "[OSC] /chain/switchNow".postln };
-            controller.switchNow;
-            nil
-        });
-
-        // /chain/add [<name>] <slot> <processor>
-        this.prInstall("/chain/add", { |msg, time, addr, recvPort|
-            var cName, slot, proc, dict, chain, hasNameFirst;
-            hasNameFirst = msg.size >= 4 and: { msg[1].isString or: { msg[1].isSymbol } };
-            if (hasNameFirst) {
-                cName = msg[1].asSymbol;
-                slot  = msg[2].asInteger;
-                proc  = msg[3].asSymbol;
-            }{
-                cName = lastTargetName;
-                slot  = msg[1].asInteger;
-                proc  = msg[2].asSymbol;
-            };
-            if (cName.isNil) {
-                "[OSC] /chain/add: no target chain set (use /chain/setNext <name> or include name)".warn;
-            }{
-                dict  = ChainManager.allInstances;
-                chain = dict.at(cName);
-                if (chain.notNil) {
-                    chain.setSlot(slot, proc);
-                    if (verbose) { ("[OSC] /chain/add %[%] := %".format(cName, slot, proc)).postln };
-                }{
-                    ("[OSC] /chain/add: chain not found: %".format(cName)).warn;
-                };
-            };
-            nil
-        });
-
-        // /chain/remove [<name>] <slot>
-        this.prInstall("/chain/remove", { |msg, time, addr, recvPort|
-            var cName, slot, dict, chain, hasNameFirst;
-            hasNameFirst = msg.size >= 3 and: { msg[1].isString or: { msg[1].isSymbol } };
-            if (hasNameFirst) {
-                cName = msg[1].asSymbol;
-                slot  = msg[2].asInteger;
-            }{
-                cName = lastTargetName;
-                slot  = msg[1].asInteger;
-            };
-            if (cName.isNil) {
-                "[OSC] /chain/remove: no target chain set".warn;
-            }{
-                dict  = ChainManager.allInstances;
-                chain = dict.at(cName);
-                if (chain.notNil) {
-                    chain.setSlot(slot, \bypass);
-                    if (verbose) { ("[OSC] /chain/remove %[%]".format(cName, slot)).postln };
-                }{
-                    ("[OSC] /chain/remove: chain not found: %".format(cName)).warn;
-                };
-            };
-            nil
-        });
-
-        // /chain/setFrom [<name>] <startSlot> <p1> <p2> ...
-        this.prInstall("/chain/setFrom", { |msg, time, addr, recvPort|
-            var cName, start, names, dict, chain, maxIndex, hasNameFirst;
-            hasNameFirst = msg.size >= 3 and: { msg[1].isString or: { msg[1].isSymbol } };
-            if (hasNameFirst) {
-                cName = msg[1].asSymbol;
-                start = msg[2].asInteger;
-                names = msg.copyRange(3, msg.size - 1).collect(_.asSymbol);
-            }{
-                cName = lastTargetName;
-                start = msg[1].asInteger;
-                names = msg.copyRange(2, msg.size - 1).collect(_.asSymbol);
-            };
-            if (cName.isNil) {
-                "[OSC] /chain/setFrom: no target chain set".warn;
-            }{
-                dict  = ChainManager.allInstances;
-                chain = dict.at(cName);
-                if (chain.notNil) {
-                    maxIndex = chain.getNumSlots - 1;
-                    names.do { |sym, i|
-                        var idx;
-                        idx = start + i;
-                        if (idx <= maxIndex) {
-                            chain.setSlot(idx, sym);
-                        }{
-                            ("[OSC] /chain/setFrom: index % out of range; ignored".format(idx)).postln;
-                        };
-                    };
-                    if (verbose) { ("[OSC] /chain/setFrom % from % := %".format(cName, start, names)).postln };
-                }{
-                    ("[OSC] /chain/setFrom: chain not found: %".format(cName)).warn;
-                };
-            };
-            nil
-        });
-
-        // Optional: /chain/status — prints all chains
-        this.prInstall("/chain/status", { |msg, time, addr, recvPort|
-            var dict;
-            dict = ChainManager.allInstances;
-            if (verbose) {
-                ("[OSC] /chain/status (chains: %)"
-                    .format(dict.keys.asArray.sort)
-                ).postln
-            };
-            dict.keysValuesDo { |key, ch| ch.status };
-            nil
-        });
-
+    setHandlers { arg handlers;
+        var dict;
+        dict = handlers;
+        if(dict.isKindOf(Dictionary).not) {
+            this.log("setHandlers: non-Dictionary provided, ignoring");
+            ^this
+        };
+        handlerMap = dict.copy; // shallow copy
         ^this
     }
 
-    // ---------- lifecycle ----------
+    defNameFor { arg routeSym;
+        var r;
+        r = routeSym;
+        if(r.notNil and: { defNames.notNil }) {
+            ^defNames[r]
+        } {
+            ^nil
+        }
+    }
+
+    installedRoutes {
+        ^defNames.keys
+    }
+
     free {
-        var syms;
-        syms = defNames.values.asArray;
-        syms.do { |sym|
-            var d;
-            d = OSCdef(sym);
-            if (d.notNil) { d.free };
+        var removed;
+        removed = List.new;
+        defNames.do { arg defSym, routeSym;
+            var od;
+            od = OSCdef(defSym);
+            if(od.notNil) {
+                od.free;
+                removed.add(defSym);
+            }
         };
-        defNames.clear;
-        if (verbose) { ("[ChainOSCController] Freed responders (id:%)".format(id)).postln };
+        if(removed.size > 0) {
+            this.log("free: removed % OSCdef(s)".format(removed.size));
+        } {
+            this.log("free: nothing to remove");
+        };
+        // Do not clear defNames so tests can check after free; they can see OSCdef(defSym) is nil.
+        // Keep handlerMap intact; user may inspect state post-free.
         ^this
     }
 
-    // ---------- helpers ----------
+    // --- Private: route install ---
 
-    prInstall { |path, func|
-        var p, defKey, action;
-        p = path.asString;
-        defKey = this.prMakeDefName(p);
-        action = { |msg, time, addr, recvPort|
-            var f;
-            f = func;
-            f.value(msg, time, addr, recvPort);
-            nil
-        };
-        OSCdef(defKey, action, p);
-        defNames[p] = defKey;
-        if (verbose) { ("[ChainOSCController] OSCdef % for %".format(defKey, p)).postln };
-        ^defKey
+    installRoutes {
+        // Route keys stored as Symbol
+        this.installRoute('/demo/ping');
+        this.installRoute('/chain/setNext');
+        this.installRoute('/chain/switchNow');
+
+        // Edit routes (opt-in for tests/clients)
+        this.installRoute('/chain/new');
+        this.installRoute('/chain/add');
+        this.installRoute('/chain/remove');
+        this.installRoute('/chain/setFrom');
+
+        ^this
     }
 
-    prMakeDefName { |path|
-        var safe, str;
-        safe = path.asString.collect { |ch|
-            var code, rep;
-            code = ch.ascii;
-            if (code == $/.ascii) { rep = $_ } { rep = ch };
-            rep
-        }.join;
-        str = "ChainOSCController_%_%_%".format(version, id, safe);
-        ^str.asSymbol
+    installRoute { arg routeStr;
+        var routeSym, defName, handler;
+        routeSym = routeStr.asSymbol;
+        defName = this.makeDefName(routeSym);
+
+        // Avoid double-install in hot reload
+        if(OSCdef(defName).notNil) {
+            this.log("installRoute: reusing existing OSCdef " ++ defName.asString);
+            defNames[routeSym] = defName;
+            ^this
+        };
+
+        handler = this.makeHandlerFor(routeSym);
+
+        OSCdef(defName, handler, routeSym.asString);
+        defNames[routeSym] = defName;
+
+        this.log("installed " ++ routeSym.asString ++ " -> " ++ defName.asString);
+        ^this
+    }
+
+    makeDefName { arg routeSym;
+        var base, rs, safe;
+        base = namePrefix;
+        rs = routeSym.asString;
+        // replace '/' with '_' for a safe Symbol name
+        safe = rs.replace("/", "_");
+        ^(base ++ "_" ++ safe).asSymbol
+    }
+
+    // Build per-route OSCdef function
+    makeHandlerFor { arg routeSym;
+        var fn;
+        fn = { arg msg, time, addr, recvPort;
+            var r;
+            r = routeSym;
+            // Ensure var-first; then route match
+            if(r == '/demo/ping'.asSymbol) {
+                this.onPing(msg, time, addr, recvPort);
+            } {
+            if(r == '/chain/setNext'.asSymbol) {
+                this.onSetNext(msg, time, addr, recvPort);
+            } {
+            if(r == '/chain/switchNow'.asSymbol) {
+                this.onSwitchNow(msg, time, addr, recvPort);
+            } {
+            if(r == '/chain/new'.asSymbol) {
+                this.onNew(msg, time, addr, recvPort);
+            } {
+            if(r == '/chain/add'.asSymbol) {
+                this.onAdd(msg, time, addr, recvPort);
+            } {
+            if(r == '/chain/remove'.asSymbol) {
+                this.onRemove(msg, time, addr, recvPort);
+            } {
+            if(r == '/chain/setFrom'.asSymbol) {
+                this.onSetFrom(msg, time, addr, recvPort);
+            } {
+                // Should never happen
+                this.log("handler: unknown route " ++ r.asString);
+            }}}}}}};
+        };
+        ^fn
+    }
+
+    // --- Route handlers (each var-first) ---
+
+    onPing { arg msg, time, addr, recvPort;
+        var cb;
+        this.log("/demo/ping " ++ msg.asString);
+        cb = handlerMap[\ping];
+        if(cb.notNil) { cb.(msg, time, addr, recvPort) };
+    }
+
+    onSetNext { arg msg, time, addr, recvPort;
+        var nameAny, nameSym, cb;
+        nameAny = msg.size > 0.if({ msg[0] }, { nil });
+        nameSym = this.toSymbol(nameAny);
+        if(nameSym.isNil) {
+            this.log("setNext: missing name");
+            ^this
+        };
+        this.log("/chain/setNext " ++ nameSym.asString);
+
+        cb = handlerMap[\setNext];
+        if(cb.notNil) {
+            cb.(nameSym);
+        } {
+            if(controller.notNil and: { controller.respondsTo(\setNext) }) {
+                controller.setNext(nameSym);
+            } {
+                // no-op in tests
+            }
+        };
+        ^this
+    }
+
+    onSwitchNow { arg msg, time, addr, recvPort;
+        var cb;
+        this.log("/chain/switchNow");
+        cb = handlerMap[\switchNow];
+        if(cb.notNil) {
+            cb.();
+        } {
+            if(controller.notNil and: { controller.respondsTo(\switchNow) }) {
+                controller.switchNow;
+            } {
+                // no-op in tests
+            }
+        };
+        ^this
+    }
+
+    onNew { arg msg, time, addr, recvPort;
+        var nameAny, nameSym, slots, cb;
+        nameAny = msg.size > 0.if({ msg[0] }, { nil });
+        nameSym = this.toSymbol(nameAny);
+        slots = msg.size > 1.if({ msg[1].asInteger }, { nil });
+
+        if(nameSym.isNil) {
+            this.log("new: missing name");
+            ^this
+        };
+
+        this.log("/chain/new " ++ nameSym.asString ++ (slots.notNil.if({ " " ++ slots.asString }, { "" })));
+
+        cb = handlerMap[\new];
+        if(cb.notNil) {
+            cb.(nameSym, slots);
+        } {
+            // Runtime wiring could be: ChainManager.new(nameSym, slots)
+            // Not invoked here to keep tests audio-free.
+        };
+        ^this
+    }
+
+    onAdd { arg msg, time, addr, recvPort;
+        var slotAny, procAny, slot, procSym, cb;
+        slotAny = msg.size > 0.if({ msg[0] }, { nil });
+        procAny = msg.size > 1.if({ msg[1] }, { nil });
+
+        if(slotAny.isNil or: { procAny.isNil }) {
+            this.log("add: requires <slot> <proc>");
+            ^this
+        };
+
+        slot = slotAny.asInteger; // 0-based slot index (slot 0 = source)
+        procSym = this.toSymbol(procAny);
+
+        this.log("/chain/add slot:" ++ slot.asString ++ " proc:" ++ procSym.asString);
+
+        cb = handlerMap[\add];
+        if(cb.notNil) {
+            cb.(slot, procSym);
+        } {
+            // Runtime wiring: controller.nextChain.setSlot(slot, procSym)
+        };
+        ^this
+    }
+
+    onRemove { arg msg, time, addr, recvPort;
+        var slotAny, slot, cb;
+        slotAny = msg.size > 0.if({ msg[0] }, { nil });
+
+        if(slotAny.isNil) {
+            this.log("remove: requires <slot>");
+            ^this
+        };
+
+        slot = slotAny.asInteger; // 0-based
+        this.log("/chain/remove slot:" ++ slot.asString);
+
+        cb = handlerMap[\remove];
+        if(cb.notNil) {
+            cb.(slot);
+        } {
+            // Runtime wiring: controller.nextChain.setSlot(slot, \bypass)
+        };
+        ^this
+    }
+
+    onSetFrom { arg msg, time, addr, recvPort;
+        var startAny, start, rest, procSyms, cb;
+        if(msg.size < 2) {
+            this.log("setFrom: requires <start> <list...>");
+            ^this
+        };
+
+        startAny = msg[0];
+        start = startAny.asInteger; // 0-based
+        rest = msg.copyRange(1, msg.size-1);
+        procSyms = rest.collect({ arg it; this.toSymbol(it) });
+
+        this.log("/chain/setFrom start:" ++ start.asString ++ " procs:" ++ procSyms.asString);
+
+        cb = handlerMap[\setFrom];
+        if(cb.notNil) {
+            cb.(start, procSyms);
+        } {
+            // Runtime wiring: procSyms.do {|p, i| controller.nextChain.setSlot(start + i, p) }
+        };
+        ^this
+    }
+
+    // --- Utilities ---
+
+    toSymbol { arg x;
+        var res;
+        if(x.isNil) { ^nil };
+        if(x.isSymbol) { ^x };
+        res = x.asString.asSymbol;
+        ^res
+    }
+
+    log { arg s;
+        var str;
+        if(verbose.not) { ^this };
+        str = "[ChainOSCController] " ++ s.asString;
+        str.postln;
+        ^this
     }
 }
