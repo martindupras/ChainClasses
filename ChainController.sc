@@ -1,15 +1,15 @@
 // ChainController.sc
-// v0.2  — MD 20250905
-// - Adds accessors for currentChain / nextChain so GUI & other modules can read them
-// - Safe logging; returns ^this for chaining
+// v0.2
+// MD 20250905: gate posts by 'verbose'; make status nil-safe.
 
 ChainController : Object {
     classvar < version = "v0.2";
-    var <currentChain, <nextChain;   // <-- expose getters for GUI & others
-    var verbose = true;
+    var currentChain, nextChain, verbose = true;
 
     *new { |verbose = true|
-        ^super.new.init(verbose)
+        var instance;
+        instance = super.new.init(verbose);
+        ^instance
     }
 
     init { |v|
@@ -22,7 +22,7 @@ ChainController : Object {
 
     setCurrent { |chainManager|
         currentChain = chainManager;
-        if (verbose and: { chainManager.notNil }) {
+        if (verbose) {
             ("[ChainController] Current chain set to %".format(chainManager.getName)).postln;
         };
         ^this
@@ -30,33 +30,41 @@ ChainController : Object {
 
     setNext { |chainManager|
         nextChain = chainManager;
-        if (verbose and: { chainManager.notNil }) {
+        if (verbose) {
             ("[ChainController] Next chain set to %".format(chainManager.getName)).postln;
         };
         ^this
     }
 
     switchNow {
-        if (nextChain.notNil) {
-            if (currentChain.notNil) {
-                currentChain.stop;
-            };
+        var hadNext, hadCurrent, newName;
+        hadNext = nextChain.notNil;
+        hadCurrent = currentChain.notNil;
+
+        if (hadNext) {
+            if (hadCurrent) { currentChain.stop };
             nextChain.play;
             currentChain = nextChain;
             nextChain = nil;
-            if (verbose and: { currentChain.notNil }) {
-                ("[ChainController] Switched to chain %.".format(currentChain.getName)).postln;
+            newName = currentChain.getName;
+            if (verbose) {
+                ("[ChainController] Switched to chain %.".format(newName)).postln;
             };
-        } {
-            "[ChainController] No next chain to switch to.".postln;
+        }{
+            if (verbose) {
+                "[ChainController] No next chain to switch to.".postln;
+            };
         };
         ^this
     }
 
     status {
-        var cur = currentChain.tryPerform(\getName) ?? { "None" };
-        var nxt = nextChain.tryPerform(\getName) ?? { "None" };
-        ("[ChainController] Current: %, Next: %".format(cur, nxt)).postln;
+        var curName, nxtName;
+        curName = if (currentChain.notNil) { currentChain.getName } { "None" };
+        nxtName = if (nextChain.notNil) { nextChain.getName } { "None" };
+        if (verbose) {
+            ("[ChainController] Current: %, Next: %".format(curName, nxtName)).postln;
+        };
         ^this
     }
 }
