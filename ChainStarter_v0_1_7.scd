@@ -158,7 +158,8 @@ s.waitForBoot({
             // UI: defer to AppClock
             if(~statusUI.notNil) { { ~statusUI.setNext(chain) }.defer; };
         },
-        \switchNow -> {
+
+/*        \switchNow -> {
             var becomingCurrent, autoUsedLocal;
             becomingCurrent = ~nextChainRef;
             autoUsedLocal = false;
@@ -182,7 +183,49 @@ s.waitForBoot({
 
             ~post.("switchNow: performed");
             ~controller.status;
-        }
+        }*/
+		\switchNow -> {
+    var becomingCurrent, autoUsedLocal, curForUI;
+
+    becomingCurrent = ~nextChainRef;
+    autoUsedLocal = false;
+
+    if(becomingCurrent.notNil) {
+        ~controller.setNext(becomingCurrent);
+        autoUsedLocal = true;
+        ~post.("switchNow: auto-promoted local ~nextChainRef (" ++ becomingCurrent.getName.asString ++ ")");
+    };
+
+    ~controller.switchNow;
+
+    // --- Robust UI update: find what is actually playing if we didn't have a local pointer
+    curForUI = becomingCurrent;
+    if(curForUI.isNil) {
+        var all;
+        all = ChainManager.allInstances;  // IdentityDictionary name -> instance
+        all.valuesDo({ arg ch;
+            if(ch.notNil and: { ch.isPlaying }) { curForUI = ch };
+        });
+        if(curForUI.notNil) {
+            ~post.("switchNow: detected current playing chain -> " ++ curForUI.getName.asString);
+        } {
+            ~post.("switchNow: no playing chain detected.");
+        };
+    };
+
+    if(curForUI.notNil and: { ~statusUI.notNil }) {
+        { ~statusUI.setCurrent(curForUI) }.defer;
+    };
+
+    if(autoUsedLocal) {
+        ~nextChainRef = nil;
+        if(~statusUI.notNil) { { ~statusUI.setNext(nil) }.defer };
+    };
+
+    ~post.("switchNow: performed");
+    ~controller.status;
+}
+
     ];
 
     // Create controller (verbose true so you can see status)

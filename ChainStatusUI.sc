@@ -1,10 +1,10 @@
 // Filename: ChainStatusUI.sc
-// Version: v0.2.0
+// Version: v0.2.1
 // Purpose: Read-only GUI showing Current and Next chains with colored slot boxes.
 // Notes:
 // - Boxes per slot: source (slot 0) = blue; active effect = green; bypass = light grey; next (queued) = orange.
-// - Auto-resizes to show up to 'maxSlots' (detects from current/next chains).
-// - Call .setCurrent(chainOrNil) and .setNext(chainOrNil). Calls are GUI-safe (.defer refresh).
+// - Auto-resizes up to maxSlots by observing current/next chain sizes.
+// - Call .setCurrent(chainOrNil) and .setNext(chainOrNil). Calls schedule refresh on AppClock.
 // - Conservative syntax: no '??', no '?', var-first in all Functions.
 
 ChainStatusUI {
@@ -26,7 +26,6 @@ ChainStatusUI {
 
     init { arg title, pollRate;
         var w, lineH, pad, fontSize, f1, f2;
-
         pollHz = pollRate;
         currentChainRef = nil;
         nextChainRef = nil;
@@ -82,12 +81,8 @@ ChainStatusUI {
         ^this
     }
 
-    // Create N slot boxes in 'panel'
     buildBoxes { arg panel, boxArray, labelArray, slots;
-        var i, cols, spacing, boxW, boxH, x0, y0, row, col, bx, by, box, lab;
-        var fontSmall;
-
-        // simple grid: up to 8 slots -> 8 in one row; 9+ -> wrap to two rows
+        var i, cols, spacing, boxW, boxH, x0, y0, row, col, bx, by, box, lab, fontSmall;
         cols = slots.min(8);
         spacing = 6;
         boxW = ((panel.bounds.width - (cols - 1) * spacing).max(160) / cols).clip(28, 80);
@@ -96,7 +91,6 @@ ChainStatusUI {
         y0 = 0;
         fontSmall = monoFont.size_(11);
 
-        // clear old if any
         boxArray.do({ arg v; v.remove });
         labelArray.do({ arg v; v.remove });
         boxArray.clear; labelArray.clear;
@@ -120,7 +114,6 @@ ChainStatusUI {
         });
     }
 
-    // Public API
     setCurrent { arg chainOrNil;
         var ch;
         ch = chainOrNil;
@@ -185,7 +178,6 @@ ChainStatusUI {
         ^this
     }
 
-    // Utility
     slotColorFor { arg symbol, isCurrent, index;
         var sym, isByp, isSrc;
         sym = symbol.asSymbol;
@@ -214,28 +206,23 @@ ChainStatusUI {
 
         cSlots = 0;
         nSlots = 0;
-
         if(c.notNil) { cSlots = c.getNumSlots };
         if(n.notNil) { nSlots = n.getNumSlots };
 
-        needed = max(cSlots, nSlots);
+        needed = cSlots.max(nSlots);
         if(needed == 0) { needed = maxSlots };
-        if(needed != maxSlots) {
-            this.setMaxSlots(needed);
-            ^this
-        };
+        if(needed != maxSlots) { this.setMaxSlots(needed) };
 
         cname = "Current: -";
         if(c.notNil) { cname = "Current: " ++ c.getName.asString };
-        titleCurrent.string = cname;
+        titleCurrent.string_(cname);
 
         nname = "Next: -";
         if(n.notNil) { nname = "Next: " ++ n.getName.asString };
-        titleNext.string = nname;
+        titleNext.string_(nname);
 
         cSpec = Array.fill(maxSlots, { \bypass });
         nSpec = Array.fill(maxSlots, { \bypass });
-
         if(c.notNil) { cSpec = c.getSpec };
         if(n.notNil) { nSpec = n.getSpec };
 
@@ -245,15 +232,15 @@ ChainStatusUI {
             box = currentBoxes[i];
             lab = currentLabels[i];
             color = this.slotColorFor(sym, true, i);
-            if(box.notNil) { box.background = color };
-            if(lab.notNil) { lab.string = this.shortName(sym) };
+            if(box.notNil) { box.background_(color) };
+            if(lab.notNil) { lab.string_(this.shortName(sym)) };
 
             sym = (i < nSpec.size).if({ nSpec[i] }, { \bypass });
             box = nextBoxes[i];
             lab = nextLabels[i];
             color = this.slotColorFor(sym, false, i);
-            if(box.notNil) { box.background = color };
-            if(lab.notNil) { lab.string = this.shortName(sym) };
+            if(box.notNil) { box.background_(color) };
+            if(lab.notNil) { lab.string_(this.shortName(sym)) };
 
             i = i + 1;
         });
