@@ -84,6 +84,7 @@ s.waitForBoot({
             finalName = chain.getName;
             ~byName[finalName] = chain;
             ~nextChainRef = chain;  // make newly created chain the current "next" target by default
+			~statusUI.tryPerform(\setNext, chain);
             ~post.("new: created " ++ finalName.asString ++ " slots:" ++ chain.getNumSlots.asString);
             chain.status;  // prints spec
         },
@@ -157,6 +158,9 @@ s.waitForBoot({
     // Install OSC surface (verbose true for readable logs)
     ~osc = ChainOSCController.new("starter", ~controller, handlers, true);
     ~post.("OSC routes installed: " ++ ~osc.installedRoutes.asString);
+
+	~statusUI = ~statusUI ?? { ChainStatusUI.new("Chain Status v6") };
+
 
     // ---------------------------
     // Diagnostics helpers
