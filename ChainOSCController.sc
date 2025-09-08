@@ -1,9 +1,10 @@
 // Filename: ChainOSCController.sc
-// Version: v0.3.6
+// Version: v0.3.7
 // Change notes:
-// - v0.3.6: Fix operator precedence in size checks: wrap comparisons, e.g. (msg.size > 0).if(...).
-//           Keeps read-only accessors (<) and assigns ivars directly (no setters).
-// - v0.3.5: Setter-free internal assigns; keep public accessors read-only.
+// - v0.3.7: Correct OSC argument indexing (msg[0] is address; first payload is msg[1]).
+//           Fix toSymbol() to use isKindOf(Symbol) (avoid DNU on numbers).
+// - v0.3.6: Fix operator precedence in size checks; keep read-only accessors and direct ivar assigns.
+// - v0.3.5: Setter-free internal assigns; keep public accessors read-only (<).
 // - v0.3.4: Always (re)bind OSCdef in installRoute to avoid stale handlers on recompile/rerun.
 // - v0.3.3: Added /chain/new, /chain/add, /chain/remove, /chain/setFrom; named OSCdefs; handler Functions; free(); Symbol normalization.
 
@@ -64,7 +65,7 @@ ChainOSCController {
     free {
         var removed;
         removed = List.new;
-        // Dictionary.do passes: value, key
+        // Dictionary.do yields values (defSym) by default
         defNames.do { arg defSym, routeSym;
             var od;
             od = OSCdef(defSym);
@@ -150,6 +151,7 @@ ChainOSCController {
 
     onPing { arg msg, time, addr, recvPort;
         var cb;
+        // msg[0] is address; payload starts at msg[1]
         this.log("/demo/ping " ++ msg.asString);
         cb = handlerMap[\ping];
         if(cb.notNil) { cb.(msg, time, addr, recvPort) };
@@ -157,7 +159,7 @@ ChainOSCController {
 
     onSetNext { arg msg, time, addr, recvPort;
         var nameAny, nameSym, cb;
-        nameAny = (msg.size > 0).if({ msg[0] }, { nil });
+        nameAny = (msg.size > 1).if({ msg[1] }, { nil });
         nameSym = this.toSymbol(nameAny);
         if(nameSym.isNil) { this.log("setNext: missing name"); ^this };
         this.log("/chain/setNext " ++ nameSym.asString);
@@ -180,9 +182,9 @@ ChainOSCController {
 
     onNew { arg msg, time, addr, recvPort;
         var nameAny, nameSym, slots, cb;
-        nameAny = (msg.size > 0).if({ msg[0] }, { nil });
+        nameAny = (msg.size > 1).if({ msg[1] }, { nil });
         nameSym = this.toSymbol(nameAny);
-        slots = (msg.size > 1).if({ msg[1].asInteger }, { nil });
+        slots = (msg.size > 2).if({ msg[2].asInteger }, { nil });
         if(nameSym.isNil) { this.log("new: missing name"); ^this };
         this.log("/chain/new " ++ nameSym.asString ++ (slots.notNil.if({ " " ++ slots.asString }, { "" })));
         cb = handlerMap[\new];
@@ -192,8 +194,8 @@ ChainOSCController {
 
     onAdd { arg msg, time, addr, recvPort;
         var slotAny, procAny, slot, procSym, cb;
-        slotAny = (msg.size > 0).if({ msg[0] }, { nil });
-        procAny = (msg.size > 1).if({ msg[1] }, { nil });
+        slotAny = (msg.size > 1).if({ msg[1] }, { nil });
+        procAny = (msg.size > 2).if({ msg[2] }, { nil });
         if(slotAny.isNil or: { procAny.isNil }) { this.log("add: requires <slot> <proc>"); ^this };
         slot = slotAny.asInteger; // 0-based
         procSym = this.toSymbol(procAny);
@@ -205,7 +207,7 @@ ChainOSCController {
 
     onRemove { arg msg, time, addr, recvPort;
         var slotAny, slot, cb;
-        slotAny = (msg.size > 0).if({ msg[0] }, { nil });
+        slotAny = (msg.size > 1).if({ msg[1] }, { nil });
         if(slotAny.isNil) { this.log("remove: requires <slot>"); ^this };
         slot = slotAny.asInteger; // 0-based
         this.log("/chain/remove slot:" ++ slot.asString);
@@ -216,10 +218,11 @@ ChainOSCController {
 
     onSetFrom { arg msg, time, addr, recvPort;
         var startAny, start, rest, procSyms, cb;
-        if(msg.size < 2) { this.log("setFrom: requires <start> <list...>"); ^this };
-        startAny = msg[0];
+        // Need at least address + start + one proc => size >= 3
+        if(msg.size < 3) { this.log("setFrom: requires <start> <list...>"); ^this };
+        startAny = msg[1];
         start = startAny.asInteger;
-        rest = msg.copyRange(1, msg.size - 1);
+        rest = msg.copyRange(2, msg.size - 1);
         procSyms = rest.collect({ arg it; this.toSymbol(it) });
         this.log("/chain/setFrom start:" ++ start.asString ++ " procs:" ++ procSyms.asString);
         cb = handlerMap[\setFrom];
@@ -232,7 +235,7 @@ ChainOSCController {
     toSymbol { arg x;
         var res;
         if(x.isNil) { ^nil };
-        if(x.isSymbol) { ^x };
+        if(x.isKindOf(Symbol)) { ^x };
         res = x.asString.asSymbol;
         ^res
     }
