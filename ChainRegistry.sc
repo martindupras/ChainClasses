@@ -13,7 +13,7 @@ ChainRegistry : Object {
 	}
 
 	init { |v|
-		var keys;
+		//var keys;
 		verbose = v;
 		if (verbose) {
 			("[ChainRegistry] Initialized (% version)").format(version).postln;

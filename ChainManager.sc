@@ -1,4 +1,4 @@
-/*  ChainManager.sc  — v2.3
+/*  ChainManager.sc  — v2.3.1
     Manages an Ndef-based audio-effect chain with N slots (default 8).
 
     Key improvements vs. v2:
@@ -18,7 +18,7 @@
 */
 
 ChainManager : Object {
-	classvar < version = "v2.2";
+	classvar < version = "v2.3.1";
 	var verbose = true;
 
 	// ----- class state -----
@@ -66,9 +66,9 @@ ChainManager : Object {
 	}
 
 	// ----- init -----
-	init { |nm = nil, nSlots = 8, verbose = true|
+	init { |nm = nil, nSlots = 8, argVerbose = true|
 		var baseName, finalName;
-		verbose = verbose;
+		verbose = argVerbose;
 		if (verbose) { ("[ChainManager] Initialized (% version)").format(version).postln };
 
 		baseName = if (nm.isNil) { "chain" } { nm.asString };
@@ -380,114 +380,6 @@ ChainManager : Object {
 
 		Ndef(name).fadeTime = previousFadeTime;
 		server.latency = previousLatency;
-		^this
-	}
-
-
-	// Schedule a single server bundle at 'delta' seconds from now
-	// that: (a) disables fade/latency, (b) applies 'editFunction', and (c) clears immediately.
-	// This prevents any delayed /n_set or /n_free after clear.
-	editAndFreeBundled { |editFunction, delta = 0.05|
-		var server, previousLatency, previousFadeTime;
-
-		server = Ndef(name).server ? Server.default;
-		previousLatency = server.latency;
-		previousFadeTime = Ndef(name).fadeTime;
-
-		// Set no-latency / no-fade for the *inside* of the bundle
-		server.latency = 0.0;
-		Ndef(name).fadeTime = 0.0;
-
-		server.makeBundle(delta, {
-			// Apply user edits (slot swaps, setChainSpec, etc.)
-			editFunction.value;
-
-			// Hard clear now, in the same timestamp
-			Ndef(name).clear;
-		});
-
-		// Restore settings immediately
-		Ndef(name).fadeTime = previousFadeTime;
-		server.latency = previousLatency;
-
-		// Update registry/local state now (the server will clear at 'delta')
-		registry.removeAt(name);
-		isPlaying = false;
-
-		^this
-	}
-
-
-	// Schedules a release (stop) now, then clears after a small wait
-	// - waitSeconds: optional; defaults to (server.latency + 0.05).max(0.05)
-	endThenClear { |waitSeconds = nil|
-		var server, previousLatency, previousFadeTime, waitTime;
-
-		server = Ndef(name).server ? Server.default;
-		previousLatency = server.latency;
-		previousFadeTime = Ndef(name).fadeTime;
-
-		// choose a safe delay so 'now' bundle is never 'late' and release precedes clear
-		waitTime = if (waitSeconds.isNil) { (previousLatency + 0.05).max(0.05) } { waitSeconds.max(0.01) };
-
-		// 1) schedule a 'now' bundle: no-fade release
-		server.makeBundle(0.0, {
-			Ndef(name).fadeTime = 0.0;  // no crossfade
-			Ndef(name).stop;            // release gate (no fade)
-		});
-
-		// 2) schedule the clear in the near future (after release lands)
-		server.makeBundle(waitTime, {
-			Ndef(name).clear;           // hard clear (no /n_set after this)
-		});
-
-		// restore local settings immediately (server work is queued)
-		Ndef(name).fadeTime = previousFadeTime;
-
-		// update registry/state after the scheduled clear
-		AppClock.sched(waitTime, {
-			registry.removeAt(name);
-			isPlaying = false;
-			^nil
-		});
-
-		^this
-	}
-
-	// Perform edits and release in one 'now' bundle, then clear after a small wait.
-	// - editFunction: slot edits (setSlot, setChainSpec, etc.). Keep them server-light.
-	// - waitSeconds: optional; default same as above.
-	editEndThenClearBundled { |editFunction, waitSeconds = nil|
-		var server, previousLatency, previousFadeTime, waitTime;
-
-		server = Ndef(name).server ? Server.default;
-		previousLatency = server.latency;
-		previousFadeTime = Ndef(name).fadeTime;
-
-		waitTime = if (waitSeconds.isNil) { (previousLatency + 0.05).max(0.05) } { waitSeconds.max(0.01) };
-
-		// 1) 'now' bundle: disable fades, do edits, then release
-		server.makeBundle(0.0, {
-			Ndef(name).fadeTime = 0.0;
-			editFunction.value;   // e.g. setSlot(2, \iDoNotExist), etc.
-			Ndef(name).stop;      // schedule release (no fade)
-		});
-
-		// 2) future bundle: clear after release
-		server.makeBundle(waitTime, {
-			Ndef(name).clear;
-		});
-
-		// restore local fadeTime
-		Ndef(name).fadeTime = previousFadeTime;
-
-		// language-side cleanup after clear is sent
-		AppClock.sched(waitTime, {
-			registry.removeAt(name);
-			isPlaying = false;
-			^nil
-		});
-
 		^this
 	}
 
