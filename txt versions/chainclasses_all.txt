@@ -1,0 +1,1866 @@
+// ChainController.sc
+// v0.2
+// MD 20250905: gate posts by 'verbose'; make status nil-safe.
+
+ChainController : Object {
+    classvar < version = "v0.2";
+    var currentChain, nextChain, verbose = true;
+
+    *new { |verbose = true|
+        var instance;
+        instance = super.new.init(verbose);
+        ^instance
+    }
+
+    init { |v|
+        verbose = v;
+        if (verbose) {
+            ("[ChainController] Initialized (% version)").format(version).postln;
+        };
+        ^this
+    }
+
+    setCurrent { |chainManager|
+        currentChain = chainManager;
+        if (verbose) {
+            ("[ChainController] Current chain set to %".format(chainManager.getName)).postln;
+        };
+        ^this
+    }
+
+    setNext { |chainManager|
+        nextChain = chainManager;
+        if (verbose) {
+            ("[ChainController] Next chain set to %".format(chainManager.getName)).postln;
+        };
+        ^this
+    }
+
+    switchNow {
+        var hadNext, hadCurrent, newName;
+        hadNext = nextChain.notNil;
+        hadCurrent = currentChain.notNil;
+
+        if (hadNext) {
+            if (hadCurrent) { currentChain.stop };
+            nextChain.play;
+            currentChain = nextChain;
+            nextChain = nil;
+            newName = currentChain.getName;
+            if (verbose) {
+                ("[ChainController] Switched to chain %.".format(newName)).postln;
+            };
+        }{
+            if (verbose) {
+                "[ChainController] No next chain to switch to.".postln;
+            };
+        };
+        ^this
+    }
+
+    status {
+        var curName, nxtName;
+        curName = if (currentChain.notNil) { currentChain.getName } { "None" };
+        nxtName = if (nextChain.notNil) { nextChain.getName } { "None" };
+        if (verbose) {
+            ("[ChainController] Current: %, Next: %".format(curName, nxtName)).postln;
+        };
+        ^this
+    }
+}
+// ChainGUIManager.sc
+// v0.1
+// MD 20250905:1330
+
+ChainGUIManager : Object {
+	classvar < version = "v0.1";
+	var verbose = true;
+	var controller;
+	var window, currentText, nextText;
+
+	*new { |controller, verbose = true|
+		var instance;
+		instance = super.new.init(controller, verbose);
+		^instance
+	}
+
+	init { |ctrl, v|
+		var name;
+		controller = ctrl;
+		verbose = v;
+		if (verbose) {
+			("[ChainGUIManager] Initialized (% version)").format(version).postln;
+		};
+
+		name = "ChainGUIManager_" ++ version;
+		window = Window(name, Rect(100, 100, 400, 120));
+		currentText = StaticText(window, Rect(10, 10, 380, 40));
+		nextText = StaticText(window, Rect(10, 60, 380, 40));
+
+		window.front;
+		this.updateDisplay;
+		^this
+	}
+
+	// safer: won't crash if controller/current/next are nil
+	updateDisplay {
+		var curObj, nextObj, currentName, nextName;
+		curObj = controller.tryPerform(\currentChain);
+		nextObj = controller.tryPerform(\nextChain);
+		currentName = curObj.tryPerform(\getName) ?? { "None" };
+		nextName    = nextObj.tryPerform(\getName) ?? { "None" };
+		currentText.string = "Current Chain: " ++ currentName;
+		nextText.string    = "Next Chain: " ++ nextName;
+		if (verbose) {
+			("[ChainGUIManager] Display updated: Current = %, Next = %"
+				.format(currentName, nextName)).postln;
+		};
+		^this
+	}
+
+/*
+    updateDisplay {
+        var currentName, nextName;
+        currentName = controller.currentChain.getName ? "None";
+        nextName = controller.nextChain.getName ? "None";
+
+        currentText.string = "Current Chain: " ++ currentName;
+        nextText.string = "Next Chain: " ++ nextName;
+
+        if (verbose) {
+            ("[ChainGUIManager] Display updated: Current = %, Next = %"
+                .format(currentName, nextName)).postln;
+        };
+        ^this
+    }*/
+}
+/*  ChainManager.sc  — v2.2
+    Manages an Ndef-based audio-effect chain with N slots (default 8).
+
+    Key improvements vs. v2:
+      - setSlot() keeps slotSpec coherent (unknown filters -> \bypass).
+      - free(): disables crossfades and hard-clears Ndef (quiet teardown).
+      - Helpers for deterministic edits/teardown:
+          setSlotNoFade(index, symbol)
+          setChainSpecNoFade(arrayOfSymbols)
+          withNoFade({ ... })
+          withNoLatency({ ... })
+          withNoLatencyNoFade({ ... })
+          withBundleNow({ ... })
+          withNoLatencyNoFadeBundled({ ... })
+          freeImmediate()
+
+    Style: var-first in every Function/closure; lowercase descriptive names; accessors spaced.
+*/
+
+ChainManager : Object {
+    classvar < version = "v2.2";
+    var verbose = true;
+
+    // ----- class state -----
+    classvar < registry;      // IdentityDictionary[nameSymbol -> instance]
+    classvar < nameCounter;   // Integer counter for auto-unique names
+
+    // ----- instance state -----
+    var < name;               // Symbol used as Ndef key
+    var < numSlots;           // Integer >= 2
+    var < slotSpec;           // Array of Symbols, e.g. [\testsignal, \bypass, ...]
+    var < procDefs;           // IdentityDictionary[\symbol -> maker Function]
+    var < isPlaying;          // Boolean
+    var <> fadeTime = 0.1;    // Float; forwarded to Ndef(name).fadeTime
+
+    *initClass {
+        registry = IdentityDictionary.new;
+        nameCounter = 0;
+    }
+
+    *uniqueName { |base = \chain|
+        var candidate;
+        candidate = base.asSymbol;
+        while { registry.includesKey(candidate) } {
+            nameCounter = nameCounter + 1;
+            candidate = (base.asString ++ nameCounter.asString).asSymbol;
+        };
+        ^candidate   // -> a unique Symbol for chain/Ndef name
+    }
+
+    *new { |name = nil, numSlots = 8|
+        var instance;
+        instance = super.new.init(name, numSlots);
+        ^instance    // -> new ChainManager instance
+    }
+
+    *allInstances {
+        ^registry.copy   // -> copy of { name -> instance } for discovery/GUI/bulk ops
+    }
+
+// ChainManager.sc
+*freeAll {
+    var instances = registry.values.asArray;   // snapshot
+    instances.do { |inst| inst.freeImmediate }; // immediate clear, less chance of late /n_set
+    ^this
+}
+
+
+/*    *freeAll {
+        var keys, i;
+        keys = registry.keys;
+        i = 0;
+        while { i < keys.size } {
+            registry[keys[i]].free;
+            i = i + 1;
+        };
+        ^this
+    }*/
+
+    // ----- init -----
+    init { |nm = nil, nSlots = 8, verbose = true|
+        var baseName, finalName;
+        verbose = verbose;
+        if (verbose) { ("[ChainManager] Initialized (% version)").format(version).postln };
+
+        baseName = if (nm.isNil) { "chain" } { nm.asString };
+        if (registry.isNil) { registry = IdentityDictionary.new };
+        finalName = this.class.uniqueName(baseName.asSymbol);
+
+        numSlots  = nSlots.max(2);
+        name      = finalName.asSymbol;
+        isPlaying = false;
+
+        this.defineDefaultProcDefs;
+
+        // Default: slot 0 is source; others bypass
+        slotSpec = Array.fill(numSlots, { \bypass });
+        slotSpec.put(0, \testsignal);
+
+        this.buildChain;
+
+        registry.put(name, this);
+        ^this
+    }
+
+    // ----- processor definitions (in-class; can be externalized later) -----
+    defineDefaultProcDefs {
+        var hp, lp, trem, bypass, testsig;
+
+        // High-pass (gentle)
+        hp = {
+            \filter -> { |in, freq = 300|
+                var cut;
+                cut = freq.clip(10, 20000);
+                HPF.ar(in, cut)
+            }
+        };
+
+        // Low-pass (gentle)
+        lp = {
+            \filter -> { |in, freq = 2000|
+                var cut;
+                cut = freq.clip(50, 20000);
+                LPF.ar(in, cut)
+            }
+        };
+
+        // Chopping tremolo
+        trem = {
+            \filter -> { |in, rate = 12, depth = 1.0, duty = 0.5|
+                var chop, amount, dutyClamped;
+                dutyClamped = duty.clip(0.05, 0.95);
+                amount      = depth.clip(0, 1);
+                chop        = LFPulse.kr(rate.max(0.1), 0, dutyClamped).lag(0.001);
+                in * (chop * amount + (1 - amount))
+            }
+        };
+
+        // Bypass
+        bypass = { \filter -> { |in| in } };
+
+        // Pulsed test signal (stereo), not obnoxious
+        testsig = {
+            {
+                var trig, env, freqs, tone, pan, amp;
+                trig  = Impulse.kr(2);
+                env   = Decay2.kr(trig, 0.01, 0.15);
+                freqs = [220, 330];
+                tone  = SinOsc.ar(freqs, 0, 0.15).sum;
+                amp   = env * 0.9;
+                pan   = [-0.2, 0.2];
+                [tone * amp, tone * amp] * (1 + pan)
+            }
+        };
+
+        procDefs = IdentityDictionary.new;
+        procDefs.put(\hp,         hp);
+        procDefs.put(\lp,         lp);
+        procDefs.put(\tremolo,    trem);
+        procDefs.put(\bypass,     bypass);
+        procDefs.put(\testsignal, testsig);
+    }
+
+    addProcessor { |keySymbol, makerFunc|
+        var key;
+        key = keySymbol.asSymbol;
+        procDefs.put(key, makerFunc);
+        ^this
+    }
+
+    // ----- build chain from slotSpec -----
+    buildChain {
+        var index, symbol, maker;
+
+        // 1) fade time
+        Ndef(name).fadeTime = fadeTime;
+
+        // 2) slot 0: source
+        symbol = slotSpec[0];
+        maker  = procDefs.at(symbol);
+        if (maker.isNil) {
+            maker = procDefs[\testsignal];
+            slotSpec.put(0, \testsignal);
+        };
+        Ndef(name)[0] = maker.value;
+
+        // 3) slots 1..end: filters
+        index = 1;
+        while { index < numSlots } {
+            symbol = slotSpec[index];
+            maker  = procDefs.at(symbol);
+            if (maker.isNil) { maker = procDefs[\bypass] };
+            Ndef(name)[index] = maker.value;
+            index = index + 1;
+        };
+    }
+
+    // ----- transport -----
+    play {
+        var wasPlaying;
+        wasPlaying = isPlaying;
+        if (wasPlaying.not) {
+            Ndef(name).play;
+            isPlaying = true;
+        };
+        ^this
+    }
+
+    stop {
+        var wasPlaying;
+        wasPlaying = isPlaying;
+        if (wasPlaying) {
+            Ndef(name).stop;
+            isPlaying = false;
+        };
+        ^this
+    }
+
+    // Quiet free: force no-fade and hard-clear (no stop/release)
+    free {
+        var removedInstance, previousFadeTime;
+
+        previousFadeTime = Ndef(name).fadeTime;
+        Ndef(name).fadeTime = 0.0;
+        Ndef(name).clear;
+        Ndef(name).fadeTime = previousFadeTime;
+
+        removedInstance = registry.removeAt(name);
+        isPlaying = false;
+        ^removedInstance  // -> removed instance or nil
+    }
+
+    // Immediate, bundled free to avoid any delayed messages
+    freeImmediate {
+        var removedInstance, previousFadeTime, server;
+
+        server = Ndef(name).server ? Server.default;
+        previousFadeTime = Ndef(name).fadeTime;
+
+        server.makeBundle(0.0, {
+            Ndef(name).fadeTime = 0.0;
+            Ndef(name).clear;
+        });
+
+        Ndef(name).fadeTime = previousFadeTime;
+
+        removedInstance = registry.removeAt(name);
+        isPlaying = false;
+        ^removedInstance  // -> removed instance or nil
+    }
+
+    // ----- slot edits -----
+    setSlot { |index, symbol|
+        var slotIndex, sym, maker;
+
+        slotIndex = index.asInteger.clip(0, numSlots - 1);
+        sym       = symbol.asSymbol;
+
+        slotSpec.put(slotIndex, sym);
+        maker = procDefs.at(sym);
+
+        if (maker.isNil) {
+            if (slotIndex == 0) {
+                maker = procDefs[\testsignal];
+                slotSpec.put(0, \testsignal);
+            } {
+                maker = procDefs[\bypass];
+                slotSpec.put(slotIndex, \bypass);  // keep spec truthful for filters
+            };
+        };
+
+        if (slotIndex == 0) {
+            Ndef(name)[0] = maker.value;     // source
+        } {
+            Ndef(name)[slotIndex] = maker.value;   // filter
+        };
+
+        ^this
+    }
+
+    setChainSpec { |arrayOfSymbols|
+        var spec, symbol;
+
+        spec = arrayOfSymbols.as(Array);
+
+        if (spec.size < numSlots) {
+            spec = spec ++ Array.fill(numSlots - spec.size, { \bypass });
+        } {
+            if (spec.size > numSlots) {
+                spec = spec.copyRange(0, numSlots - 1);
+            };
+        };
+
+        symbol = spec[0];
+        if (procDefs.at(symbol).isNil or: { symbol != \testsignal }) {
+            spec.put(0, \testsignal);
+        };
+
+        slotSpec = spec;
+        this.buildChain;
+        ^this
+    }
+
+    // ----- helpers: no-fade / no-latency / bundling -----
+    setSlotNoFade { |index, symbol|
+        var previousFadeTime;
+        previousFadeTime = Ndef(name).fadeTime;
+        Ndef(name).fadeTime = 0.0;
+        this.setSlot(index, symbol);
+        Ndef(name).fadeTime = previousFadeTime;
+        ^this
+    }
+
+    setChainSpecNoFade { |arrayOfSymbols|
+        var previousFadeTime;
+        previousFadeTime = Ndef(name).fadeTime;
+        Ndef(name).fadeTime = 0.0;
+        this.setChainSpec(arrayOfSymbols);
+        Ndef(name).fadeTime = previousFadeTime;
+        ^this
+    }
+
+    withNoFade { |function|
+        var previousFadeTime;
+        previousFadeTime = Ndef(name).fadeTime;
+        Ndef(name).fadeTime = 0.0;
+        function.value;
+        Ndef(name).fadeTime = previousFadeTime;
+        ^this
+    }
+
+    withNoLatency { |function|
+        var server, previousLatency;
+        server = Ndef(name).server ? Server.default;
+        previousLatency = server.latency;
+        server.latency = 0.0;
+        function.value;
+        server.latency = previousLatency;
+        ^this
+    }
+
+    withNoLatencyNoFade { |function|
+        var server, previousLatency, previousFadeTime;
+        server = Ndef(name).server ? Server.default;
+        previousLatency = server.latency;
+        previousFadeTime = Ndef(name).fadeTime;
+        server.latency = 0.0;
+        Ndef(name).fadeTime = 0.0;
+        function.value;
+        Ndef(name).fadeTime = previousFadeTime;
+        server.latency = previousLatency;
+        ^this
+    }
+
+    withBundleNow { |function|
+        var server;
+        server = Ndef(name).server ? Server.default;
+        server.makeBundle(0.0, { function.value });
+        ^this
+    }
+
+    withNoLatencyNoFadeBundled { |function|
+        var server, previousLatency, previousFadeTime;
+        server = Ndef(name).server ? Server.default;
+        previousLatency = server.latency;
+        previousFadeTime = Ndef(name).fadeTime;
+
+        server.latency = 0.0;
+        Ndef(name).fadeTime = 0.0;
+
+        server.makeBundle(0.0, {
+            function.value;
+        });
+
+        Ndef(name).fadeTime = previousFadeTime;
+        server.latency = previousLatency;
+        ^this
+    }
+
+
+	// Schedule a single server bundle at 'delta' seconds from now
+// that: (a) disables fade/latency, (b) applies 'editFunction', and (c) clears immediately.
+// This prevents any delayed /n_set or /n_free after clear.
+editAndFreeBundled { |editFunction, delta = 0.05|
+    var server, previousLatency, previousFadeTime;
+
+    server = Ndef(name).server ? Server.default;
+    previousLatency = server.latency;
+    previousFadeTime = Ndef(name).fadeTime;
+
+    // Set no-latency / no-fade for the *inside* of the bundle
+    server.latency = 0.0;
+    Ndef(name).fadeTime = 0.0;
+
+    server.makeBundle(delta, {
+        // Apply user edits (slot swaps, setChainSpec, etc.)
+        editFunction.value;
+
+        // Hard clear now, in the same timestamp
+        Ndef(name).clear;
+    });
+
+    // Restore settings immediately
+    Ndef(name).fadeTime = previousFadeTime;
+    server.latency = previousLatency;
+
+    // Update registry/local state now (the server will clear at 'delta')
+    registry.removeAt(name);
+    isPlaying = false;
+
+    ^this
+}
+
+
+	// Schedules a release (stop) now, then clears after a small wait
+// - waitSeconds: optional; defaults to (server.latency + 0.05).max(0.05)
+endThenClear { |waitSeconds = nil|
+    var server, previousLatency, previousFadeTime, waitTime;
+
+    server = Ndef(name).server ? Server.default;
+    previousLatency = server.latency;
+    previousFadeTime = Ndef(name).fadeTime;
+
+    // choose a safe delay so 'now' bundle is never 'late' and release precedes clear
+    waitTime = if (waitSeconds.isNil) { (previousLatency + 0.05).max(0.05) } { waitSeconds.max(0.01) };
+
+    // 1) schedule a 'now' bundle: no-fade release
+    server.makeBundle(0.0, {
+        Ndef(name).fadeTime = 0.0;  // no crossfade
+        Ndef(name).stop;            // release gate (no fade)
+    });
+
+    // 2) schedule the clear in the near future (after release lands)
+    server.makeBundle(waitTime, {
+        Ndef(name).clear;           // hard clear (no /n_set after this)
+    });
+
+    // restore local settings immediately (server work is queued)
+    Ndef(name).fadeTime = previousFadeTime;
+
+    // update registry/state after the scheduled clear
+    AppClock.sched(waitTime, {
+        registry.removeAt(name);
+        isPlaying = false;
+        ^nil
+    });
+
+    ^this
+}
+
+// Perform edits and release in one 'now' bundle, then clear after a small wait.
+// - editFunction: slot edits (setSlot, setChainSpec, etc.). Keep them server-light.
+// - waitSeconds: optional; default same as above.
+editEndThenClearBundled { |editFunction, waitSeconds = nil|
+    var server, previousLatency, previousFadeTime, waitTime;
+
+    server = Ndef(name).server ? Server.default;
+    previousLatency = server.latency;
+    previousFadeTime = Ndef(name).fadeTime;
+
+    waitTime = if (waitSeconds.isNil) { (previousLatency + 0.05).max(0.05) } { waitSeconds.max(0.01) };
+
+    // 1) 'now' bundle: disable fades, do edits, then release
+    server.makeBundle(0.0, {
+        Ndef(name).fadeTime = 0.0;
+        editFunction.value;   // e.g. setSlot(2, \iDoNotExist), etc.
+        Ndef(name).stop;      // schedule release (no fade)
+    });
+
+    // 2) future bundle: clear after release
+    server.makeBundle(waitTime, {
+        Ndef(name).clear;
+    });
+
+    // restore local fadeTime
+    Ndef(name).fadeTime = previousFadeTime;
+
+    // language-side cleanup after clear is sent
+    AppClock.sched(waitTime, {
+        registry.removeAt(name);
+        isPlaying = false;
+        ^nil
+    });
+
+    ^this
+}
+
+    // ----- params, status, help -----
+    set { |...paramPairs|
+        var pairs;
+        pairs = paramPairs;
+        if (pairs.size.odd) {
+            ("ChainManager[%]: odd number of set() items ignored tail.").format(name).warn;
+        };
+        Ndef(name).set(*pairs);
+        ^this
+    }
+
+    status {
+        var info;
+        info = "ChainManager[%] slots: %".format(name, slotSpec);
+        info.postln;
+        ^slotSpec.copy   // -> copy so callers can’t mutate internal state
+    }
+
+    help {
+        var keys, lines;
+        keys = procDefs.keys.asArray.sort;
+        lines = [
+            "ChainManager.help",
+            "----------------------------------------",
+            "Create:    c = ChainManager.new(\\myChain, 8);",
+            "Play/Stop: c.play;  c.stop;",
+            "Inspect:   c.status;  // prints and returns copy of slot spec",
+            "Set slot:  c.setSlot(3, \\hp);  c.setSlot(4, \\lp);  c.setSlot(5, \\tremolo);",
+            "Set chain: c.setChainSpec([\\testsignal, \\hp, \\tremolo, \\lp, \\bypass, \\bypass, \\bypass, \\bypass]);",
+            "Params:    Ndef(c.getName).set(\\freq, 600, \\rate, 14, \\depth, 1.0);",
+            "",
+            "Helpers: setSlotNoFade, setChainSpecNoFade, withNoFade, withNoLatency,",
+            "         withNoLatencyNoFade, withBundleNow, withNoLatencyNoFadeBundled, freeImmediate",
+            "Available processors: " ++ keys.asString
+        ];
+        lines.do { |line| line.postln };
+        ^this
+    }
+
+    // ----- simple accessors -----
+    getName { ^name }
+    getNumSlots { ^numSlots }
+    getSpec { ^slotSpec.copy }
+}
+// Filename: ChainOSCController.sc
+// Version: v0.3.8
+// Change notes:
+// - v0.3.8: Refactor variable names to be descriptive; add instance/class `help` methods; add concise header.
+// - v0.3.7: Correct OSC payload indexing (msg[1..]); toSymbol uses isKindOf(Symbol).
+// - v0.3.6: Fix boolean precedence in size checks; keep read-only accessors; direct ivar assigns.
+// - v0.3.5: Setter-free internal assigns; keep public accessors read-only (<).
+// - v0.3.4: Always (re)bind OSCdef in installRoute to avoid stale handlers on recompile/rerun.
+// - v0.3.3: Added edit routes; named OSCdefs; handler Functions; free(); Symbol normalization.
+//
+// Summary (≤30 lines):
+// ChainOSCController is the SINGLE OSC entry point for a live-performance chain system.
+// It installs named OSCdef routes (per instance), normalizes payloads, and forwards actions
+// to either provided handler Functions or an optional ChainController instance.
+// Key routes (payloads start at msg[1], since msg[0] is the address):
+//   /demo/ping
+//   /chain/setNext <name>
+//   /chain/switchNow
+//   /chain/new <name> [<slots>]
+//   /chain/add <slot> <proc>       // 0-based slots; slot 0 = source
+//   /chain/remove <slot>           // 0-based
+//   /chain/setFrom <start> <list>  // 0-based; applies procs at start+i
+// Notes:
+//   - Names/procs are normalized to Symbols (\Name, \tremolo).
+//   - Uses Dictionary+Symbol keys; named OSCdef per route; .free removes only installed defs.
+//   - Tests can pass handler Functions; runtime can pass a real ChainController.
+// See .help for usage and examples.
+
+ChainOSCController {
+    classvar <defaultVerbose;
+    var <verbose;
+    var <namePrefix;
+    var <defNames;     // Dictionary: routeSymbol -> defNameSymbol (the OSCdef key)
+    var <handlerMap;   // Dictionary: actionSymbol -> Function
+    var <controller;   // optional ChainController
+
+    *initClass {
+        defaultVerbose = false;
+    }
+
+    *new { arg name, controller = nil, handlers = nil, verbose;
+        var chosenVerbose;
+        chosenVerbose = verbose;
+        if(chosenVerbose.isNil) { chosenVerbose = defaultVerbose };
+        ^super.new.init(name, controller, handlers, chosenVerbose)
+    }
+
+    // args renamed to avoid ivar shadowing; assign ivars directly (no setters)
+    init { arg nameArg, controllerArg, handlersArg, verboseArg;
+        var nameString;
+        verbose = if(verboseArg.isNil) { defaultVerbose } { verboseArg };
+        controller = controllerArg;
+        defNames = Dictionary.new;
+        handlerMap = Dictionary.new;
+
+        nameString = nameArg;
+        if(nameString.isNil) { nameString = "osc" };
+        namePrefix = ("ChainOSCController%" ++ this.identityHash.asString ++ "%" ++ nameString.asString);
+
+        if(handlersArg.notNil) { this.setHandlers(handlersArg) };
+
+        this.installRoutes;
+        ^this
+    }
+
+    // --- Public API ---
+
+    setHandlers { arg handlers;
+        var handlersDict;
+        handlersDict = handlers;
+        if(handlersDict.isKindOf(Dictionary).not) {
+            this.log("setHandlers: non-Dictionary provided, ignoring");
+            ^this
+        };
+        handlerMap = handlersDict.copy;
+        ^this
+    }
+
+    defNameFor { arg routeSymbol;
+        ^defNames[routeSymbol]
+    }
+
+    installedRoutes {
+        ^defNames.keys
+    }
+
+    free {
+        var removedDefNames;
+        removedDefNames = List.new;
+        // Dictionary.do yields values (defNameSymbol) then keys (routeSymbol)
+        defNames.do { arg defNameSymbol, routeSymbol;
+            var oscdefObject;
+            oscdefObject = OSCdef(defNameSymbol);
+            if(oscdefObject.notNil) {
+                oscdefObject.free;
+                removedDefNames.add(defNameSymbol);
+            }
+        };
+        if(removedDefNames.size > 0) {
+            this.log("free: removed % OSCdef(s)".format(removedDefNames.size));
+        } {
+            this.log("free: nothing to remove");
+        };
+        ^this
+    }
+
+    // Useful quick reference printed to post window
+    help {
+        var banner;
+        banner = "ChainOSCController routes (payload indexing starts at msg[1]):\n"
+        ++ "  /demo/ping\n"
+        ++ "  /chain/setNext <name>\n"
+        ++ "  /chain/switchNow\n"
+        ++ "  /chain/new <name> [<slots>]\n"
+        ++ "  /chain/add <slot> <proc>\n"
+        ++ "  /chain/remove <slot>\n"
+        ++ "  /chain/setFrom <start> <list...>\n\n"
+        ++ "Notes:\n"
+        ++ "  - 0-based slot indexing (slot 0 = source)\n"
+        ++ "  - Names/procs normalized to Symbols (\"B\" -> \\B, \"tremolo\" -> \\tremolo)\n"
+        ++ "  - Named OSCdefs per instance; .free only removes those\n\n"
+        ++ "Example (no audio):\n"
+        ++ "  h = Dictionary[ \\setNext -> { |name| (\"setNext:\" + name).postln } ];\n"
+        ++ "  c = ChainOSCController.new(\"demo\", nil, h, true);\n"
+        ++ "  n = NetAddr(\"127.0.0.1\", NetAddr.langPort);\n"
+        ++ "  n.sendMsg(\"/chain/setNext\", \"B\");  // -> \\B\n"
+        ++ "  c.free;";
+        banner.postln;
+        ^this
+    }
+
+    *help {
+        var instance;
+        instance = ChainOSCController.new("help", nil, nil, true);
+        instance.help;
+        instance.free;
+        ^"See post window for usage."
+    }
+
+    // --- Private: route install ---
+
+    installRoutes {
+        this.installRoute('/demo/ping');
+        this.installRoute('/chain/setNext');
+        this.installRoute('/chain/switchNow');
+        this.installRoute('/chain/new');
+        this.installRoute('/chain/add');
+        this.installRoute('/chain/remove');
+        this.installRoute('/chain/setFrom');
+        ^this
+    }
+
+    installRoute { arg routeString;
+        var routeSymbol, defNameSymbol, handlerFunction;
+        routeSymbol = routeString.asSymbol;
+        defNameSymbol = this.makeDefName(routeSymbol);
+        handlerFunction = this.makeHandlerFor(routeSymbol);
+
+        // Always (re)bind so changes take effect after recompile/rerun.
+        OSCdef(defNameSymbol, handlerFunction, routeString);
+        defNames[routeSymbol] = defNameSymbol;
+
+        this.log("installed/updated " ++ routeSymbol.asString ++ " -> " ++ defNameSymbol.asString);
+        ^this
+    }
+
+    makeDefName { arg routeSymbol;
+        var base, routeAsString, safeRoute;
+        base = namePrefix;
+        routeAsString = routeSymbol.asString;
+        safeRoute = routeAsString.replace("/", "_");
+        ^(base ++ "_" ++ safeRoute).asSymbol
+    }
+
+    // Build per-route OSCdef function
+    makeHandlerFor { arg routeSymbol;
+        var handlerFunc;
+        handlerFunc = { arg msg, time, addr, recvPort;
+            var routeSymbolLocal;
+            routeSymbolLocal = routeSymbol;
+            if(routeSymbolLocal == '/demo/ping'.asSymbol) {
+                this.onPing(msg, time, addr, recvPort);
+            } {
+            if(routeSymbolLocal == '/chain/setNext'.asSymbol) {
+                this.onSetNext(msg, time, addr, recvPort);
+            } {
+            if(routeSymbolLocal == '/chain/switchNow'.asSymbol) {
+                this.onSwitchNow(msg, time, addr, recvPort);
+            } {
+            if(routeSymbolLocal == '/chain/new'.asSymbol) {
+                this.onNew(msg, time, addr, recvPort);
+            } {
+            if(routeSymbolLocal == '/chain/add'.asSymbol) {
+                this.onAdd(msg, time, addr, recvPort);
+            } {
+            if(routeSymbolLocal == '/chain/remove'.asSymbol) {
+                this.onRemove(msg, time, addr, recvPort);
+            } {
+            if(routeSymbolLocal == '/chain/setFrom'.asSymbol) {
+                this.onSetFrom(msg, time, addr, recvPort);
+            } {
+                this.log("handler: unknown route " ++ routeSymbolLocal.asString);
+            }}}}}}};
+        };
+        ^handlerFunc
+    }
+
+    // --- Route handlers (var-first) ---
+
+    onPing { arg msg, time, addr, recvPort;
+        var callback;
+        // msg[0] is address; payload starts at msg[1]
+        this.log("/demo/ping " ++ msg.asString);
+        callback = handlerMap[\ping];
+        if(callback.notNil) { callback.(msg, time, addr, recvPort) };
+    }
+
+    onSetNext { arg msg, time, addr, recvPort;
+        var nameAny, nameSymbol, callback;
+        nameAny = (msg.size > 1).if({ msg[1] }, { nil });
+        nameSymbol = this.toSymbol(nameAny);
+        if(nameSymbol.isNil) { this.log("setNext: missing name"); ^this };
+        this.log("/chain/setNext " ++ nameSymbol.asString);
+        callback = handlerMap[\setNext];
+        if(callback.notNil) { callback.(nameSymbol) } {
+            if(controller.notNil and: { controller.respondsTo(\setNext) }) { controller.setNext(nameSymbol) };
+        };
+        ^this
+    }
+
+    onSwitchNow { arg msg, time, addr, recvPort;
+        var callback;
+        this.log("/chain/switchNow");
+        callback = handlerMap[\switchNow];
+        if(callback.notNil) { callback.() } {
+            if(controller.notNil and: { controller.respondsTo(\switchNow) }) { controller.switchNow };
+        };
+        ^this
+    }
+
+    onNew { arg msg, time, addr, recvPort;
+        var nameAny, nameSymbol, slots, callback;
+        nameAny = (msg.size > 1).if({ msg[1] }, { nil });
+        nameSymbol = this.toSymbol(nameAny);
+        slots = (msg.size > 2).if({ msg[2].asInteger }, { nil });
+        if(nameSymbol.isNil) { this.log("new: missing name"); ^this };
+        this.log("/chain/new " ++ nameSymbol.asString ++ (slots.notNil.if({ " " ++ slots.asString }, { "" })));
+        callback = handlerMap[\new];
+        if(callback.notNil) { callback.(nameSymbol, slots) };
+        ^this
+    }
+
+    onAdd { arg msg, time, addr, recvPort;
+        var slotAny, procAny, slotIndex, procSymbol, callback;
+        slotAny = (msg.size > 1).if({ msg[1] }, { nil });
+        procAny = (msg.size > 2).if({ msg[2] }, { nil });
+        if(slotAny.isNil or: { procAny.isNil }) { this.log("add: requires <slot> <proc>"); ^this };
+        slotIndex = slotAny.asInteger; // 0-based
+        procSymbol = this.toSymbol(procAny);
+        this.log("/chain/add slot:" ++ slotIndex.asString ++ " proc:" ++ procSymbol.asString);
+        callback = handlerMap[\add];
+        if(callback.notNil) { callback.(slotIndex, procSymbol) };
+        ^this
+    }
+
+    onRemove { arg msg, time, addr, recvPort;
+        var slotAny, slotIndex, callback;
+        slotAny = (msg.size > 1).if({ msg[1] }, { nil });
+        if(slotAny.isNil) { this.log("remove: requires <slot>"); ^this };
+        slotIndex = slotAny.asInteger; // 0-based
+        this.log("/chain/remove slot:" ++ slotIndex.asString);
+        callback = handlerMap[\remove];
+        if(callback.notNil) { callback.(slotIndex) };
+        ^this
+    }
+
+    onSetFrom { arg msg, time, addr, recvPort;
+        var startAny, startIndex, restArgs, procSymbols, callback;
+        // Need at least address + start + one proc => size >= 3
+        if(msg.size < 3) { this.log("setFrom: requires <start> <list...>"); ^this };
+        startAny = msg[1];
+        startIndex = startAny.asInteger;
+        restArgs = msg.copyRange(2, msg.size - 1);
+        procSymbols = restArgs.collect({ arg item; this.toSymbol(item) });
+        this.log("/chain/setFrom start:" ++ startIndex.asString ++ " procs:" ++ procSymbols.asString);
+        callback = handlerMap[\setFrom];
+        if(callback.notNil) { callback.(startIndex, procSymbols) };
+        ^this
+    }
+
+    // --- Utilities ---
+
+    toSymbol { arg x;
+        var symbolValue;
+        if(x.isNil) { ^nil };
+        if(x.isKindOf(Symbol)) { ^x };
+        symbolValue = x.asString.asSymbol;
+        ^symbolValue
+    }
+
+    log { arg line;
+        var lineString;
+        if(verbose.not) { ^this };
+        lineString = "[ChainOSCController] " ++ line.asString;
+        lineString.postln;
+        ^this
+    }
+}
+// ChainRegistry.sc
+// v0.1
+// MD 20250905:1230
+
+ChainRegistry : Object {
+	classvar < version = "v0.1";
+	var verbose = true;
+
+	*new { |verbose = true|
+		var instance;
+		instance = super.new.init(verbose);
+		^instance
+	}
+
+	init { |v|
+		var keys;
+		verbose = v;
+		if (verbose) {
+			("[ChainRegistry] Initialized (% version)").format(version).postln;
+		};
+		^this
+	}
+
+	// ChainRegistry.sc
+	listAll {
+		var keys;
+		keys = ChainManager.allInstances.keys.asArray.sort;   // <- deterministic, sorted
+		("[ChainRegistry] Chains: %".format(keys)).postln;
+		^keys
+	}
+
+
+	describeAll {
+		var dict;
+		dict = ChainManager.allInstances;
+		dict.keysValuesDo { |key, chain|
+			chain.status;
+		};
+		^this
+	}
+
+	freeAll {
+		ChainManager.freeAll;
+		"[ChainRegistry] All chains freed.".postln;
+		^this
+	}
+}
+// ChainSignalsManager.sc
+// v0.1
+// MD 20250905:1245
+ChainSignalsManager : Object {
+	classvar < version = "v0.1";
+	var verbose = true;
+	var inputChannels = 6;
+	var outputMode = \stereo; // could be \mono, \stereo, \sixout
+
+	*new { |verbose = true|
+		var instance;
+		instance = super.new.init(verbose);
+		^instance
+	}
+
+	init { |v|
+		var modes;
+		verbose = v;
+		if (verbose) {
+			("[ChainSignalsManager] Initialized (% version)").format(version).postln;
+		};
+		modes = [\mono, \stereo, \sixout];
+		if (modes.includes(outputMode).not) {
+			outputMode = \stereo;
+		};
+		^this
+	}
+
+	setOutputMode { |modeSymbol|
+		var mode;
+		mode = modeSymbol.asSymbol;
+		if ([\mono, \stereo, \sixout].includes(mode)) {
+			outputMode = mode;
+			("[ChainSignalsManager] Output mode set to %.".format(mode)).postln;
+		} {
+			("[ChainSignalsManager] Invalid output mode: %.".format(mode)).warn;
+		};
+		^this
+	}
+
+	describeRouting {
+		("[ChainSignalsManager] Routing: % in → % out (% mode)"
+			.format(inputChannels, this.getOutputChannels, outputMode)).postln;
+		^this
+	}
+
+	getOutputChannels {
+		if (outputMode == \mono) { ^1 };
+		if (outputMode == \stereo) { ^2 };
+		if (outputMode == \sixout) { ^6 };
+		^2; // fallback
+	}
+}
+/*  Filename: ChainStatusUI.sc
+    Version:  v0.3.2
+    Purpose:  Read-only GUI showing Current and Next chains with colored slot boxes.
+
+    Key fixes:
+      - Use List instead of Array for box/label collections (Array.add returns a new Array; List.add mutates).
+      - Re-entrancy guard uses a normal ivar (no accessor, no underscore): isPaintingLock.
+      - Defaults set in init rather than in var declarations.
+
+    Notes:
+      - Boxes per slot: source (slot 0) = blue; active effect = green; bypass = light grey; next (queued) = orange.
+      - Auto-resizes up to maxSlots by observing current/next chain sizes.
+      - Call .setCurrent(chainOrNil) and .setNext(chainOrNil). UI refresh is AppClock-safe.
+      - Optional debug prints: pass debug:true to *new or use .setDebug(true).
+*/
+
+ChainStatusUI : Object {
+    var <window;
+    var <currentPanel, <nextPanel;
+    var <currentBoxes, <nextBoxes;       // List
+    var <currentLabels, <nextLabels;     // List
+    var <titleCurrent, <titleNext, <legendText;
+    var <pollRoutine, <pollHz;
+    var <currentChainRef, <nextChainRef;
+    var <maxSlots;
+    var <monoFont;
+    var <debug;                // set via setDebug
+    var isPaintingLock;        // re-entrancy guard (no accessor, no underscore)
+
+    *new { arg title = "Chain Status v6", pollRate = 4, debug = false;
+        ^super.new.init(title, pollRate, debug)
+    }
+
+    init { arg title, pollRate, debug = false;
+        var w, lineH, pad, fontSize, f1, f2;
+
+        // defaults
+        isPaintingLock = false;
+        this.setDebug(debug);
+
+        pollHz = pollRate;
+        currentChainRef = nil;
+        nextChainRef    = nil;
+        maxSlots        = 8;
+
+        fontSize = 12;
+        f1 = Font("Monaco", fontSize);
+        f2 = Font("Menlo",  fontSize);
+        monoFont = f1;
+        if(monoFont.isNil) { monoFont = f2 };
+        if(monoFont.isNil) { monoFont = Font.default };
+
+        lineH = 22;
+        pad   = 10;
+
+        w = Window(title, Rect(100, 100, 720, 360)).alwaysOnTop_(true);
+        window = w;
+
+        titleCurrent = StaticText(w, Rect(pad, pad, 320, lineH))
+            .string_("Current")
+            .font_(Font.default.size_(14))
+            .background_(Color(0.85, 1.0, 0.85));
+
+        titleNext = StaticText(w, Rect(360, pad, 320, lineH))
+            .string_("Next")
+            .font_(Font.default.size_(14))
+            .background_(Color(1.0, 0.98, 0.85));
+
+        currentPanel = CompositeView(w, Rect(pad,  pad + lineH + 6, 320, 260)).background_(Color.white);
+        nextPanel    = CompositeView(w, Rect(360, pad + lineH + 6, 320, 260)).background_(Color.white);
+
+        legendText = StaticText(w, Rect(pad, 330, 680, 18))
+            .string_("Legend: source=blue | active=green | bypass=grey | queued(next)=orange")
+            .font_(Font.default.size_(11));
+
+        // Lists (mutate in place with .add)
+        currentBoxes  = List.new;
+        nextBoxes     = List.new;
+        currentLabels = List.new;
+        nextLabels    = List.new;
+
+        // Build initial views to maxSlots; no chain yet
+        this.buildBoxes(currentPanel, currentBoxes, currentLabels, maxSlots);
+        this.buildBoxes(nextPanel,    nextBoxes,    nextLabels,    maxSlots);
+
+        w.onClose_({
+            var r;
+            r = pollRoutine;
+            if(r.notNil) { r.stop; pollRoutine = nil };
+        });
+
+        this.startPolling;
+        { this.refresh }.defer;
+        w.front;
+        ^this
+    }
+
+    // --- Diagnostics & control ---
+
+    setDebug { arg flag = true;
+        debug = (flag == true);
+        if(debug) {
+            this.log("debug enabled (id:" ++ this.identityHash.asString ++ ")");
+        };
+        ^this
+    }
+
+    describe {
+        var curN, nxtN;
+        curN = if(currentChainRef.notNil) { currentChainRef.getName } { "nil" };
+        nxtN = if(nextChainRef.notNil)    { nextChainRef.getName    } { "nil" };
+        (
+            "[ChainStatusUI] id:% maxSlots:% curBoxes:% nextBoxes:% curLabels:% nextLabels:% cur:% next:%"
+        ).format(
+            this.identityHash, maxSlots,
+            currentBoxes.size, nextBoxes.size,
+            currentLabels.size, nextLabels.size,
+            curN, nxtN
+        ).postln;
+        ^this
+    }
+
+    validateViews {
+        var ok;
+        ok = true;
+        if(window.isNil) {
+            "WARNING: ChainStatusUI.validateViews: window is nil (closed?)".warn;
+            ok = false;
+        };
+        if(currentBoxes.size != maxSlots) {
+            ("WARNING: ChainStatusUI: currentBoxes.size % vs maxSlots %")
+            .format(currentBoxes.size, maxSlots).warn;
+            ok = false;
+        };
+        if(nextBoxes.size != maxSlots) {
+            ("WARNING: ChainStatusUI: nextBoxes.size % vs maxSlots %")
+            .format(nextBoxes.size, maxSlots).warn;
+            ok = false;
+        };
+        if(currentLabels.size != maxSlots or: { nextLabels.size != maxSlots }) {
+            ("WARNING: ChainStatusUI: label array sizes mismatch (cur % next % max %)")
+            .format(currentLabels.size, nextLabels.size, maxSlots).warn;
+            ok = false;
+        };
+        ^ok
+    }
+
+    log { arg line;
+        if(debug) { ("[ChainStatusUI] " ++ line.asString).postln; };
+        ^this
+    }
+
+    // --- View construction ---
+
+    buildBoxes { arg panel, boxArray, labelArray, slots;
+        var s, i, cols, spacing, boxW, boxH, x0, y0, row, col, bx, by, box, lab, fontSmall;
+
+        s = slots.asInteger;
+        if(s.isNil or: { s < 1 }) { s = 1 };
+        if(s > 16) { s = 16 };
+
+        if(debug) { this.log(("buildBoxes(slots:%) panel:%").format(s, panel.bounds)); };
+
+        cols = s.min(8).max(1);
+        spacing = 6;
+        boxW = ((panel.bounds.width - (cols - 1) * spacing).max(160) / cols).clip(28, 80);
+        boxH = 44;
+        x0 = 0; y0 = 0;
+        fontSmall = monoFont.size_(11);
+
+        // Clear existing child views and collections
+        boxArray.do({ arg v; v.remove });
+        labelArray.do({ arg v; v.remove });
+        boxArray.clear; labelArray.clear;
+
+        i = 0;
+        while({ i < s }, {
+            row = (i / 8).floor;
+            col = i % 8;
+            bx = x0 + col * (boxW + spacing);
+            by = y0 + row * (boxH + spacing);
+
+            box = CompositeView(panel, Rect(bx, by, boxW, boxH)).background_(Color(0.95, 0.95, 0.95));
+            lab = StaticText(box, Rect(4, 4, boxW - 8, boxH - 8))
+                .string_("-")
+                .font_(fontSmall);
+
+            boxArray.add(box);
+            labelArray.add(lab);
+            i = i + 1;
+        });
+
+        if(debug) {
+            this.log(("built arrays -> boxes:% labels:% (this side)")
+                .format(boxArray.size, labelArray.size));
+        };
+        ^this
+    }
+
+    // --- Public API (runtime hooks) ---
+
+    setCurrent { arg chainOrNil;
+        var ch;
+        ch = chainOrNil;
+        currentChainRef = ch;
+        { this.refresh }.defer;
+        ^this
+    }
+
+    setNext { arg chainOrNil;
+        var ch;
+        ch = chainOrNil;
+        nextChainRef = ch;
+        { this.refresh }.defer;
+        ^this
+    }
+
+    setMaxSlots { arg slots;
+        var s;
+        s = slots;
+        if(debug) { this.log(("setMaxSlots request:% (prev max:%)").format(s, maxSlots)); };
+
+        if(s.isNil) { s = maxSlots };
+        if(s < 1)   { s = 1 };
+        if(s > 16)  { s = 16 };
+        maxSlots = s;
+
+        this.buildBoxes(currentPanel, currentBoxes, currentLabels, maxSlots);
+        this.buildBoxes(nextPanel,    nextBoxes,    nextLabels,    maxSlots);
+
+        if(debug) {
+            this.log(("setMaxSlots done -> max:% curBoxes:% nextBoxes:%")
+                .format(maxSlots, currentBoxes.size, nextBoxes.size));
+        };
+
+        { this.refresh }.defer;
+        ^this
+    }
+
+    front {
+        var w;
+        w = window;
+        if(w.notNil) { w.front };
+        ^this
+    }
+
+    free {
+        var w, r;
+        r = pollRoutine;
+        if(r.notNil) { r.stop; pollRoutine = nil };
+        w = window;
+        if(w.notNil) { w.close };
+        window = nil;
+        ^this
+    }
+
+    // --- Poller ---
+
+    startPolling {
+        var hz, wait, r;
+
+        if(pollRoutine.notNil) { pollRoutine.stop; pollRoutine = nil; };
+
+        hz = pollHz;
+        if(hz.isNil) { hz = 4 };
+        if(hz <= 0)  { ^this }; // disabled
+
+        wait = (1.0 / hz).max(0.05);
+
+        r = Routine({
+            var localWait;
+            localWait = wait;
+            while({ window.notNil }, {
+                this.refresh;
+                localWait.wait;
+            });
+        });
+
+        pollRoutine = r.play(AppClock);
+        ^this
+    }
+
+    // --- Paint helpers ---
+
+    slotColorFor { arg symbol, isCurrent, index;
+        var sym, isByp, isSrc;
+        sym = symbol.asSymbol;
+        isByp = (sym == \bypass);
+        isSrc = (index == 0);
+
+        if(isSrc)                        { ^Color(0.60, 0.80, 1.00) }; // blue: source
+        if(isByp and: { isCurrent })     { ^Color(0.90, 0.90, 0.90) }; // light grey (current)
+        if(isByp and: { isCurrent.not }) { ^Color(0.93, 0.93, 0.93) }; // slightly lighter grey (next)
+        if(isCurrent)                    { ^Color(0.70, 1.00, 0.70) }; // green: active
+        ^Color(1.00, 0.78, 0.40)                                      // orange: queued (next)
+    }
+
+    shortName { arg symbol;
+        var s;
+        s = symbol.asString;
+        if(s.size > 8) { ^(s.copyRange(0, 7) ++ "…") };
+        ^s
+    }
+
+    normalizeToSymbol { arg item, fallback = \bypass;
+        var sym;
+        if(item.isNil)            { ^fallback };
+        if(item.isKindOf(Symbol)) { ^item     };
+        if(item.isKindOf(String)) { ^item.asSymbol };
+        if(item.respondsTo(\key)) {  // Associations
+            sym = item.key; if(sym.isKindOf(Symbol)) { ^sym };
+        };
+        if(item.isKindOf(Dictionary)) {
+            sym = item[\name]; if(sym.notNil) { ^sym.asSymbol };
+            ^fallback;
+        };
+        ^fallback
+    }
+
+    // --- Main paint ---
+
+    refresh {
+        var c, n, cSpec, nSpec, cSlots, nSlots, needed;
+        var i, sym, box, lab, color, cname, nname;
+
+        if(window.isNil) { ^this }; // closed
+
+        // Re-entrancy guard
+        if(isPaintingLock) { ^this };
+        isPaintingLock = true;
+
+        if(debug) { this.validateViews; };
+
+        c = currentChainRef;
+        n = nextChainRef;
+
+        cSlots = 0; if(c.notNil) { cSlots = c.getNumSlots };
+        nSlots = 0; if(n.notNil) { nSlots = n.getNumSlots };
+
+        needed = cSlots.max(nSlots);
+        if(needed == 0) { needed = maxSlots };
+
+        // Resize and bail; deferred refresh will repaint freshly built views.
+        if(needed != maxSlots) {
+            if(debug) { this.log(("resize: needed:% (cur max:%) — rebuilding").format(needed, maxSlots)); };
+            this.setMaxSlots(needed);
+            isPaintingLock = false;
+            ^this;
+        };
+
+        cname = "Current: -"; if(c.notNil) { cname = "Current: " ++ c.getName.asString };
+        titleCurrent.string_(cname);
+
+        nname = "Next: -"; if(n.notNil) { nname = "Next: " ++ n.getName.asString };
+        titleNext.string_(nname);
+
+        cSpec = Array.fill(maxSlots, { \bypass });
+        nSpec = Array.fill(maxSlots, { \bypass });
+        if(c.notNil) { cSpec = c.getSpec };
+        if(n.notNil) { nSpec = n.getSpec };
+
+        if(debug) {
+            this.log(("paint with maxSlots:%  cur:%  next:%  (curName:% nextName:%)")
+                .format(
+                    maxSlots, cSpec, nSpec,
+                    (c.notNil).if({ c.getName }, { "nil" }),
+                    (n.notNil).if({ n.getName }, { "nil" })
+                ));
+        };
+
+        i = 0;
+        while({ i < maxSlots }, {
+            // Current
+            sym  = (i < cSpec.size).if({ this.normalizeToSymbol(cSpec[i]) }, { \bypass });
+            box  = currentBoxes[i];
+            lab  = currentLabels[i];
+            color = this.slotColorFor(sym, true, i);
+            if(box.notNil) { box.background_(color) };
+            if(lab.notNil) { lab.string_(this.shortName(sym)) };
+
+            // Next
+            sym  = (i < nSpec.size).if({ this.normalizeToSymbol(nSpec[i]) }, { \bypass });
+            box  = nextBoxes[i];
+            lab  = nextLabels[i];
+            color = this.slotColorFor(sym, false, i);
+            if(box.notNil) { box.background_(color) };
+            if(lab.notNil) { lab.string_(this.shortName(sym)) };
+
+            i = i + 1;
+        });
+
+        isPaintingLock = false;
+        ^this
+    }
+}
+// ChainTransitionManager.sc
+// v0.1c — ensure switchOnBeat schedules into the future (no immediate trigger at exact downbeat)
+// Also uses numeric rounding in logs (sclang doesn't support printf %.2f/%.3f)
+ChainTransitionManager : Object {
+    classvar < version = "v0.1c";
+    var verbose = true;
+    var controller;
+
+    *new { |controller, verbose = true|
+        ^super.new.init(controller, verbose)
+    }
+
+    init { |ctrl, v|
+        var now;
+        controller = ctrl;
+        verbose = v;
+        if (verbose) {
+            ("[ChainTransitionManager] Initialized (% version)").format(version).postln;
+        };
+        now = SystemClock.seconds.round(0.001);
+        ("[ChainTransitionManager] Ready at %".format(now)).postln;
+        ^this
+    }
+
+    // Schedule after 'seconds' on SystemClock
+    switchIn { |seconds|
+        var delay = seconds.max(0.01);
+        ("[ChainTransitionManager] Scheduled switch in % seconds."
+            .format(delay.round(0.01))).postln;
+
+        SystemClock.sched(delay, {
+            controller.switchNow;
+            nil;  // never ^return from inside scheduled functions
+        });
+
+        ^this
+    }
+
+    // Schedule on a TempoClock at the next whole beat, unless we're exactly on it:
+    // In that case, advance to the following beat. Then add (beatsAhead-1).
+    switchOnBeat { |beatClock, beatsAhead = 1|
+        var nowBeat, nextWhole, targetBeat, ahead;
+        nowBeat   = beatClock.beats;          // current absolute beat (Float)
+        nextWhole = nowBeat.ceil;             // next integer beat OR same if already integer
+        if (nextWhole == nowBeat) {           // exactly on a downbeat -> force future
+            nextWhole = nowBeat + 1;
+        };
+        ahead     = (beatsAhead - 1).max(0);
+        targetBeat = nextWhole + ahead;
+
+        ("[ChainTransitionManager] Scheduled switch on beat % (tempoClock)."
+            .format(targetBeat)).postln;
+
+        beatClock.sched(targetBeat, {
+            controller.switchNow;
+            nil;
+        });
+
+        ^this
+    }
+}
+
+
+
+/*// ChainTransitionManager.sc
+// v0.1b — MD 20250905
+// - Fix: use TempoClock.sched with beats instead of SystemClock.schedAbs + nextBeat
+// - Fix: remove caret returns from scheduled functions (no OutOfContextReturn)
+// - Log: use numeric rounding instead of printf-like specifiers
+
+ChainTransitionManager : Object {
+    classvar < version = "v0.1b";
+    var verbose = true;
+    var controller;
+
+    *new { |controller, verbose = true|
+        ^super.new.init(controller, verbose)
+    }
+
+    init { |ctrl, v|
+        var now;
+        controller = ctrl;
+        verbose = v;
+        if (verbose) {
+            ("[ChainTransitionManager] Initialized (% version)").format(version).postln;
+        };
+        now = SystemClock.seconds.round(0.001);
+        ("[ChainTransitionManager] Ready at %".format(now)).postln;
+        ^this
+    }
+
+    // Schedule a switch after 'seconds' on SystemClock
+    switchIn { |seconds|
+        var delay = seconds.max(0.01);
+        ("[ChainTransitionManager] Scheduled switch in % seconds."
+            .format(delay.round(0.01))).postln;
+
+        SystemClock.sched(delay, {
+            controller.switchNow;
+            nil; // do not ^return from inside a scheduled Function
+        });
+
+        ^this
+    }
+
+    // Schedule on a TempoClock at the next whole beat plus (beatsAhead-1)
+    switchOnBeat { |beatClock, beatsAhead = 1|
+        var baseBeat, targetBeat;
+        // next whole beat
+        baseBeat = beatClock.beats.ceil;
+        // allow ahead-of-time scheduling
+        targetBeat = baseBeat + (beatsAhead - 1).max(0);
+
+        ("[ChainTransitionManager] Scheduled switch on beat % (tempoClock)."
+            .format(targetBeat)).postln;
+
+        beatClock.sched(targetBeat, {
+            controller.switchNow;
+            nil; // do not ^return inside scheduled Function
+        });
+
+        ^this
+    }
+}*/
+
+
+/*// ChainTransitionManager.sc  (v0.1 → v0.1a)
+ChainTransitionManager : Object {
+    classvar < version = "v0.1a";
+    var verbose = true;
+    var controller;
+
+    *new { |controller, verbose = true|
+        ^super.new.init(controller, verbose)
+    }
+
+    init { |ctrl, v|
+        var now;
+        controller = ctrl;
+        verbose = v;
+        if (verbose) {
+            ("[ChainTransitionManager] Initialized (% version)").format(version).postln;
+        };
+        now = SystemClock.seconds;
+        ("[ChainTransitionManager] Ready at %.3f".format(now)).postln;
+        ^this
+    }
+
+    switchIn { |seconds|
+        var delay;
+        delay = seconds.max(0.01);
+        ("[ChainTransitionManager] Scheduled switch in %.2f seconds.".format(delay)).postln;
+        SystemClock.sched(delay, {
+            controller.switchNow;
+            nil;   // <- do NOT use ^nil here
+        });
+        ^this
+    }
+
+    switchOnBeat { |beatClock, beatsAhead = 1|
+        var beatTime;
+        beatTime = beatClock.nextBeat + (beatsAhead - 1) * beatClock.beatDur;
+        ("[ChainTransitionManager] Scheduled switch on beat at %.3f".format(beatTime)).postln;
+        SystemClock.schedAbs(beatTime, {
+            controller.switchNow;
+            nil;   // <- do NOT use ^nil here
+        });
+        ^this
+    }
+}*/
+
+
+// // ChainTransitionManager.sc
+// // v0.1
+// // MD 20250905:1315
+//
+// ChainTransitionManager : Object {
+// 	classvar < version = "v0.1";
+// 	var verbose = true;
+// 	var controller;
+//
+// 	*new { |controller, verbose = true|
+// 		var instance;
+// 		instance = super.new.init(controller, verbose);
+// 		^instance
+// 	}
+//
+// 	init { |ctrl, v|
+// 		var now;
+// 		controller = ctrl;
+// 		verbose = v;
+// 		if (verbose) {
+// 			("[ChainTransitionManager] Initialized (% version)").format(version).postln;
+// 		};
+// 		now = SystemClock.seconds;
+// 		("[ChainTransitionManager] Ready at %.3f".format(now)).postln;
+// 		^this
+// 	}
+//
+// 	switchIn { |seconds|
+// 		var delay;
+// 		delay = seconds.max(0.01);
+// 		("[ChainTransitionManager] Scheduled switch in %.2f seconds.".format(delay)).postln;
+// 		SystemClock.sched(delay, {
+// 			controller.switchNow;
+// 			^nil;
+// 		});
+// 		^this
+// 	}
+//
+// 	switchOnBeat { |beatClock, beatsAhead = 1|
+// 		var beatTime;
+// 		beatTime = beatClock.nextBeat + (beatsAhead - 1) * beatClock.beatDur;
+// 		("[ChainTransitionManager] Scheduled switch on beat at %.3f".format(beatTime)).postln;
+// 		SystemClock.schedAbs(beatTime, {
+// 			controller.switchNow;
+// 			^nil;
+// 		});
+// 		^this
+// 	}
+// }
+// OSCCommandRouter.sc
+// v0.2.1
+// MD 20250905: remove leading '_' from helper names; named OSCdef(s) + .free()
+
+OSCCommandRouter : Object {
+    classvar < version = "v0.2.1";
+    var verbose = true;
+    var controller;
+
+    var defNames; // path -> Symbol
+    var id;
+
+    *new { |controller, verbose = true|
+        var instance;
+        instance = super.new.init(controller, verbose);
+        ^instance
+    }
+
+    init { |ctrl, v|
+        var hash;
+        controller = ctrl;
+        verbose = v;
+
+        defNames = IdentityDictionary.new;
+        hash = this.identityHash;
+        id = hash;
+
+        if (verbose) {
+            ("[OSCCommandRouter] Initialized (% version, id:%)").format(version, id).postln;
+        };
+
+        this.prInstall("/chain/switchNow", { |msg, time, addr, recvPort|
+            if (verbose) { "[OSC] /chain/switchNow".postln };
+            controller.switchNow;
+            nil
+        });
+
+        ^this
+    }
+
+    free {
+        var syms;
+        syms = defNames.values.asArray;
+        syms.do { |sym|
+            var d;
+            d = OSCdef(sym);
+            if (d.notNil) { d.free };
+        };
+        defNames.clear;
+        if (verbose) { ("[OSCCommandRouter] Freed responders (id:%)".format(id)).postln };
+        ^this
+    }
+
+    prInstall { |path, func|
+        var p, defKey, action;
+        p = path.asString;
+        defKey = this.prDefNameFor(p);
+        action = { |msg, time, addr, recvPort|
+            var f;
+            f = func;
+            f.value(msg, time, addr, recvPort);
+            nil
+        };
+        OSCdef(defKey, action, p);
+        defNames[p] = defKey;
+        if (verbose) { ("[OSCCommandRouter] OSCdef % for %".format(defKey, p)).postln };
+        ^defKey
+    }
+
+    prDefNameFor { |path|
+        var safe, str;
+        safe = path.asString.collect { |ch|
+            var code, rep;
+            code = ch.ascii;
+            if (code == $/.ascii) { rep = $_ } { rep = ch };
+            rep
+        }.join;
+        str = "OSCCommandRouter_%_%_%".format(version, id, safe);
+        ^str.asSymbol
+    }
+}
+// ProcessorLibrary.sc
+// v0.1
+// MD 20250905:1345
+
+ProcessorLibrary : Object {
+    classvar < version = "v0.1";
+	classvar < global;
+    var verbose = true;
+    var processors;
+
+    *new { |verbose = true|
+        var instance;
+        instance = super.new.init(verbose);
+        ^instance
+    }
+
+	*initClass {
+    global = ProcessorLibrary.new(true);
+	}
+
+    init { |v|
+        verbose = v;
+        processors = IdentityDictionary.new;
+        if (verbose) {
+            ("[ProcessorLibrary] Initialized (% version)").format(version).postln;
+        };
+        this.defineDefaults;
+        ^this
+    }
+
+    defineDefaults {
+        this.add(\hp, {
+            \filter -> { |in, freq = 300|
+                var cut;
+                cut = freq.clip(10, 20000);
+                HPF.ar(in, cut)
+            }
+        });
+
+        this.add(\lp, {
+            \filter -> { |in, freq = 2000|
+                var cut;
+                cut = freq.clip(50, 20000);
+                LPF.ar(in, cut)
+            }
+        });
+
+        this.add(\tremolo, {
+            \filter -> { |in, rate = 12, depth = 1.0, duty = 0.5|
+                var chop, amount, dutyClamped;
+                dutyClamped = duty.clip(0.05, 0.95);
+                amount = depth.clip(0, 1);
+                chop = LFPulse.kr(rate.max(0.1), 0, dutyClamped).lag(0.001);
+                in * (chop * amount + (1 - amount))
+            }
+        });
+
+        this.add(\bypass, { \filter -> { |in| in } });
+
+        this.add(\testsignal, {
+            {
+                var trig, env, freqs, tone, pan, amp;
+                trig = Impulse.kr(2);
+                env = Decay2.kr(trig, 0.01, 0.15);
+                freqs = [220, 330];
+                tone = SinOsc.ar(freqs, 0, 0.15).sum;
+                amp = env * 0.9;
+                pan = [-0.2, 0.2];
+                [tone * amp, tone * amp] * (1 + pan)
+            }
+        });
+    }
+
+    add { |key, func|
+        processors.put(key.asSymbol, func);
+        if (verbose) {
+            ("[ProcessorLibrary] Added processor: %".format(key)).postln;
+        };
+        ^this
+    }
+
+    get { |key|
+        ^processors.at(key.asSymbol);
+    }
+
+    list {
+        ^processors.keys.asArray.sort;
+    }
+
+    describe {
+        ("[ProcessorLibrary] Available processors: %".format(this.list)).postln;
+        ^this
+    }
+}
