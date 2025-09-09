@@ -3,8 +3,8 @@
 // Purpose: Boots audio, installs OSC routes, edits a "next" chain, switches live, and shows a status GUI.
 // Notes:
 // - Uses local ~nextChainRef (Option A) to track the ChainManager instance we edit as "next".
-// - Slot indexing is 0-based (slot 0 = \testsignal). Names/procs are Symbols (normalized by ChainOSCController).
-// - Requires: ChainManager v2.2, ChainController v0.2, ChainOSCController v0.3.8+, ChainStatusUI v0.1.2.
+// - Slot indexing is 0-based (slot 0 = \testsignal). Names/procs are Symbols (normalized by ChainOSCDispatcher).
+// - Requires: ChainManager v2.2, ChainController v0.2, ChainOSCDispatcher v0.3.8+, ChainStatusUI v0.1.2.
 // - UI calls from OSC handlers are deferred to AppClock to satisfy Qt's threading rules.
 // - NEW: switchNow auto-promotes local ~nextChainRef if controller has no next set (more forgiving live flow).
 
@@ -87,7 +87,7 @@ s.waitForBoot({
         ^inst;
     };
 
-    // Runtime handlers used by ChainOSCController
+    // Runtime handlers used by ChainOSCDispatcher
     handlers = Dictionary[
         \new -> { arg nameSym, slotsInt;
             var chain, finalName, slots;
@@ -232,8 +232,8 @@ s.waitForBoot({
     ~controller = ChainController.new(true);
     ~controller.status;
 
-    // Install OSC surface (verbose true)
-    ~osc = ChainOSCController.new("starter", ~controller, handlers, true);
+	// Install OSC surface (verbose true)
+    ~osc = ChainOSCDispatcher.new("starter", ~controller, handlers, true);
     ~post.("OSC routes installed: " ++ ~osc.installedRoutes.asString);
 
     // Bring up the status UI (create once)
