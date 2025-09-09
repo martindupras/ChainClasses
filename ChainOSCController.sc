@@ -1,5 +1,5 @@
 // Filename: ChainOSCController.sc
-// Version: v0.3.8
+// Version: v0.3.9
 // Change notes:
 // - v0.3.8: Refactor variable names to be descriptive; add instance/class `help` methods; add concise header.
 // - v0.3.7: Correct OSC payload indexing (msg[1..]); toSymbol uses isKindOf(Symbol).
@@ -215,7 +215,32 @@ ChainOSCController {
         if(callback.notNil) { callback.(msg, time, addr, recvPort) };
     }
 
-    onSetNext { arg msg, time, addr, recvPort;
+	onSetNext { arg msg, time, addr, recvPort;
+    var nameAny, nameSymbol, callback, chain, all;
+    nameAny = (msg.size > 1).if({ msg[1] }, { nil });
+    nameSymbol = this.toSymbol(nameAny);
+    if(nameSymbol.isNil) { this.log("setNext: missing name"); ^this };
+
+    this.log("/chain/setNext " ++ nameSymbol.asString);
+
+    // Prefer injected handler if provided
+    callback = handlerMap[\setNext];
+    if(callback.notNil) { callback.(nameSymbol); ^this };
+
+    // Fallback: resolve by name and set on controller
+    if(controller.notNil and: { controller.respondsTo(\setNext) }) {
+        all = ChainManager.allInstances;
+        chain = all.at(nameSymbol);
+        if(chain.isNil) {
+            this.log("setNext: no chain named " ++ nameSymbol.asString ++ " found");
+            ^this;
+        };
+        controller.setNext(chain);
+    };
+    ^this
+}
+
+/*    onSetNext { arg msg, time, addr, recvPort;
         var nameAny, nameSymbol, callback;
         nameAny = (msg.size > 1).if({ msg[1] }, { nil });
         nameSymbol = this.toSymbol(nameAny);
@@ -226,7 +251,7 @@ ChainOSCController {
             if(controller.notNil and: { controller.respondsTo(\setNext) }) { controller.setNext(nameSymbol) };
         };
         ^this
-    }
+    }*/
 
     onSwitchNow { arg msg, time, addr, recvPort;
         var callback;
