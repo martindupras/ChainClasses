@@ -1,0 +1,6 @@
+// Deprecated shim: use ChainSwitchScheduler instead
+ChainTransitionManager : ChainSwitchScheduler {
+    *initClass {
+        "ChainTransitionManager is deprecated; use ChainSwitchScheduler instead.".warn;
+    }
+}
